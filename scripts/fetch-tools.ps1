@@ -24,10 +24,25 @@ $Root = Split-Path -Parent $PSScriptRoot
 $Bin = Join-Path $Root 'bin'
 New-Item -ItemType Directory -Force -Path $Bin | Out-Null
 
+# Hashing and unzipping go through .NET instead of Get-FileHash and Expand-Archive.
+# Windows PowerShell started by a program running under PowerShell 7 (yarn/npm in
+# a pwsh terminal, or GitHub Actions) inherits PowerShell 7's PSModulePath and
+# loses those script-module cmdlets ("Get-FileHash is not recognized").
+function Get-Sha256([string]$Path) {
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $stream = [IO.File]::OpenRead($Path)
+  try {
+    return -join ($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') })
+  } finally {
+    $stream.Dispose()
+    $sha.Dispose()
+  }
+}
+
 function Get-Verified([string]$Url, [string]$Destination, [string]$Sha256) {
   Write-Host "Baixando $Url"
   Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $Destination
-  $actual = (Get-FileHash -Algorithm SHA256 -Path $Destination).Hash.ToLowerInvariant()
+  $actual = Get-Sha256 $Destination
   if ($actual -ne $Sha256) {
     Remove-Item -Force $Destination
     throw "SHA-256 inesperado para $Url`n  esperado: $Sha256`n  obtido:   $actual"
@@ -48,7 +63,8 @@ if ($Force -or -not (Test-Path $Ffmpeg) -or -not (Test-Path (Join-Path $Bin 'ffp
   try {
     $zip = Join-Path $temp 'ffmpeg.zip'
     Get-Verified "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/$FfmpegRelease/$FfmpegAsset.zip" $zip $FfmpegSha256
-    Expand-Archive -Path $zip -DestinationPath $temp
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::ExtractToDirectory($zip, $temp)
     $extracted = Join-Path $temp $FfmpegAsset
     # ffplay is not used by the app.
     Get-ChildItem (Join-Path $extracted 'bin') | Where-Object { $_.Name -ne 'ffplay.exe' } |
