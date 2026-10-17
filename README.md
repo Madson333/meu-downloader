@@ -135,9 +135,11 @@ Não há extração de chaves, uso de CDMs nem contorno de servidores de licenç
 Baixe apenas conteúdo que você tem direito de baixar. Respeite os termos de
 uso de cada site e os direitos autorais.
 
-Se a pasta `bin/` não existir, baixe `yt-dlp.exe` da página de releases do
-yt-dlp e o `ffmpeg-master-latest-win64-gpl-shared.zip` do FFmpeg-Builds, e
-copie o `yt-dlp.exe`, o `ffmpeg.exe`, o `ffprobe.exe` e as DLLs para `bin/`.
+Se a pasta `bin/` não existir, rode `npm run tools`. Ele baixa o yt-dlp e o FFmpeg
+(build `win64-gpl-shared` do FFmpeg-Builds) nas versões fixadas em
+`scripts/fetch-tools.ps1` e confere o SHA-256 de cada download. Arquivos que já
+estão em `bin/` são mantidos; para trocá-los pelas versões fixadas, use
+`powershell -File scripts\fetch-tools.ps1 -Force`.
 
 ## Instalação
 
@@ -219,6 +221,22 @@ npm test
 ```
 
 O comando compila o projeto e roda os testes já compilados (`dist/test/*.test.js`).
+
+### Integração contínua
+
+O GitHub Actions (`.github/workflows/ci.yml`) roda a cada push na `main`, em pull
+requests e sob demanda (aba **Actions → CI → Run workflow**). Em um Windows limpo, ele:
+
+1. instala as dependências com `yarn install --frozen-lockfile` (falha se o
+   `yarn.lock` não estiver em dia com o `package.json`);
+2. baixa o yt-dlp e o FFmpeg com `npm run tools` (guardados em cache entre execuções);
+3. checa os tipos (`npm run typecheck`);
+4. compila e roda `npm test`. O passo falha se algum teste for **ignorado**, para
+   que uma ferramenta ausente não passe despercebida.
+
+As actions usadas são fixadas pelo commit, não por uma tag que pode mudar. Para
+atualizar o yt-dlp ou o FFmpeg usados nos testes, mude a versão e o SHA-256 em
+`scripts/fetch-tools.ps1`; isso também renova o cache do CI.
 
 Os testes sobem servidores HTTP locais e não acessam a internet nem serviços de
 streaming. Eles cobrem:

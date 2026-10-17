@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same branch or pull request cancels the run still in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tipos e testes (Windows)
+    # The app targets Windows; the tests also run the Windows builds of yt-dlp and FFmpeg.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      # The tests never start Electron; its ~100 MB binary is not needed here.
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: yarn
+
+      - name: Instalar dependências
+        run: yarn install --frozen-lockfile
+
+      # bin/ holds the pinned yt-dlp and FFmpeg; the cache key changes with their versions.
+      - name: Cache das ferramentas (bin/)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: bin
+          key: tools-${{ runner.os }}-${{ hashFiles('scripts/fetch-tools.ps1') }}
+
+      - name: Baixar yt-dlp e FFmpeg
+        run: yarn tools
+
+      - name: Checar tipos
+        run: yarn typecheck
+
+      - name: Compilar e testar
+        shell: pwsh
+        run: |
+          npm test | Tee-Object -FilePath test-output.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Tests that need bin/ are skipped when a tool is missing; in CI that is a failure.
+          $summary = Select-String -Path test-output.txt -Pattern '^# skipped (\d+)$'
+          if (-not $summary) { Write-Error 'Resumo dos testes não encontrado'; exit 1 }
+          if ($summary.Matches[0].Groups[1].Value -ne '0') { Write-Error 'Há testes ignorados: yt-dlp ou FFmpeg não foram encontrados'; exit 1 }
