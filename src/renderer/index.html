@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self'">
+  <title>Meu Downloader</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="toolbar">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v11m0 0-4.5-4.5M12 14l4.5-4.5M5 19h14" /></svg>
+      <span>Meu Downloader</span>
+    </div>
+    <button id="btn-add" class="primary" title="Adicionar URL (Ctrl+N)">+ Adicionar URL</button>
+    <div class="sep"></div>
+    <button id="btn-resume" title="Retomar selecionados">▶ Retomar</button>
+    <button id="btn-pause" title="Pausar selecionados">❚❚ Pausar</button>
+    <button id="btn-remove" title="Remover selecionados (Delete)">✕ Remover</button>
+    <div class="sep"></div>
+    <button id="btn-resume-all">Retomar tudo</button>
+    <button id="btn-pause-all">Pausar tudo</button>
+    <div class="spacer"></div>
+    <input id="search" type="search" placeholder="Buscar…" aria-label="Buscar downloads">
+    <button id="btn-settings" title="Configurações">⚙ Configurações</button>
+  </header>
+
+  <div class="main">
+    <nav class="sidebar" aria-label="Filtros">
+      <button class="filter active" data-filter="all">Todos <span class="count" data-count="all"></span></button>
+      <button class="filter" data-filter="active">Baixando <span class="count" data-count="active"></span></button>
+      <button class="filter" data-filter="queued">Na fila <span class="count" data-count="queued"></span></button>
+      <button class="filter" data-filter="paused">Pausados <span class="count" data-count="paused"></span></button>
+      <button class="filter" data-filter="completed">Concluídos <span class="count" data-count="completed"></span></button>
+      <button class="filter" data-filter="error">Com erro <span class="count" data-count="error"></span></button>
+      <div class="totals">
+        <div>Velocidade total</div>
+        <strong id="total-speed">0 B/s</strong>
+      </div>
+    </nav>
+
+    <section class="content">
+      <div class="table-wrap">
+        <table class="list">
+          <thead>
+            <tr>
+              <th class="col-name">Arquivo</th>
+              <th class="col-size">Tamanho</th>
+              <th class="col-progress">Progresso</th>
+              <th class="col-speed">Velocidade</th>
+              <th class="col-eta">Restante</th>
+              <th class="col-status">Status</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div id="empty" class="empty">
+          <p>Nenhum download ainda.</p>
+          <p class="hint">Clique em <b>+ Adicionar URL</b>, arraste um link para esta janela ou instale a extensão do navegador.</p>
+        </div>
+      </div>
+
+      <aside id="details" class="details hidden">
+        <div class="details-head">
+          <div class="details-title">
+            <strong id="d-name"></strong>
+            <span id="d-url" class="muted"></span>
+          </div>
+          <div class="details-actions">
+            <button id="d-open">Abrir</button>
+            <button id="d-folder">Mostrar na pasta</button>
+            <button id="d-copy">Copiar link</button>
+          </div>
+        </div>
+        <canvas id="d-map" class="segment-map" height="22" aria-label="Mapa de segmentos"></canvas>
+        <div class="details-grid">
+          <div><span class="muted">Baixado</span><b id="d-done"></b></div>
+          <div><span class="muted">Conexões</span><b id="d-conns"></b></div>
+          <div><span class="muted">Segmentos</span><b id="d-segs"></b></div>
+          <div><span class="muted" id="d-kind-label">Retomável</span><b id="d-resumable"></b></div>
+          <div class="wide"><span class="muted">Salvo em</span><b id="d-path"></b></div>
+          <div class="wide error-text" id="d-error"></div>
+        </div>
+      </aside>
+    </section>
+  </div>
+
+  <dialog id="dlg-add">
+    <form method="dialog" id="form-add">
+      <h2>Adicionar download</h2>
+      <label>Endereço (URL)
+        <input id="add-url" type="url" required placeholder="https://exemplo.com/arquivo.zip">
+      </label>
+      <label>Nome do arquivo <span class="muted">(opcional)</span>
+        <input id="add-name" type="text" placeholder="Usar o nome enviado pelo servidor">
+      </label>
+      <label>Salvar em
+        <span class="row">
+          <input id="add-dir" type="text" readonly>
+          <button type="button" id="add-dir-btn">Escolher…</button>
+        </span>
+      </label>
+      <label id="add-quality-row">Qualidade <span class="muted">(links de vídeo: YouTube, Vimeo, TikTok…)</span>
+        <select id="add-quality">
+          <option value="best">Melhor disponível</option>
+          <option value="2160">Até 4K (2160p)</option>
+          <option value="1440">Até 1440p</option>
+          <option value="1080">Até 1080p</option>
+          <option value="720">Até 720p</option>
+          <option value="480">Até 480p</option>
+          <option value="360">Até 360p</option>
+          <option value="audio">Só áudio (MP3)</option>
+        </select>
+      </label>
+      <label class="check"><input id="add-paused" type="checkbox"> Adicionar pausado</label>
+      <div class="dialog-actions">
+        <button value="cancel" formnovalidate>Cancelar</button>
+        <button value="ok" class="primary">Baixar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="dlg-settings">
+    <form method="dialog" id="form-settings">
+      <h2>Configurações</h2>
+      <label>Pasta de downloads
+        <span class="row">
+          <input id="set-dir" type="text" readonly>
+          <button type="button" id="set-dir-btn">Escolher…</button>
+        </span>
+      </label>
+      <div class="grid2">
+        <label>Conexões por download
+          <input id="set-conns" type="number" min="1" max="32">
+        </label>
+        <label>Downloads simultâneos
+          <input id="set-concurrent" type="number" min="1" max="10">
+        </label>
+        <label>Limite de velocidade (KB/s, 0 = sem limite)
+          <input id="set-speed" type="number" min="0">
+        </label>
+        <label>Tamanho mínimo para capturar (KB)
+          <input id="set-minsize" type="number" min="0">
+        </label>
+      </div>
+      <label id="set-quality-row">Qualidade padrão de vídeos
+        <span class="row">
+          <select id="set-quality">
+            <option value="best">Melhor disponível</option>
+          <option value="2160">Até 4K (2160p)</option>
+          <option value="1440">Até 1440p</option>
+          <option value="1080">Até 1080p</option>
+          <option value="720">Até 720p</option>
+          <option value="480">Até 480p</option>
+          <option value="360">Até 360p</option>
+          <option value="audio">Só áudio (MP3)</option>
+          </select>
+          <button type="button" id="set-update-ytdlp" title="O YouTube muda com frequência; atualize se os vídeos pararem de baixar">Atualizar yt-dlp</button>
+        </span>
+        <span id="set-update-status" class="muted"></span>
+      </label>
+      <label class="check"><input id="set-capture" type="checkbox"> Capturar downloads do navegador (extensão)</label>
+      <label>Extensões capturadas (separadas por espaço)
+        <textarea id="set-exts" rows="3"></textarea>
+      </label>
+      <div class="dialog-actions">
+        <button value="cancel" formnovalidate>Cancelar</button>
+        <button value="ok" class="primary">Salvar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="dlg-remove">
+    <form method="dialog">
+      <h2>Remover downloads</h2>
+      <p id="remove-text"></p>
+      <label class="check"><input id="remove-file" type="checkbox"> Apagar também os arquivos concluídos do disco</label>
+      <div class="dialog-actions">
+        <button value="cancel">Cancelar</button>
+        <button value="ok" class="danger">Remover</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

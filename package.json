@@ -1,0 +1,16 @@
+{
+  "name": "meu-downloader",
+  "version": "1.0.0",
+  "description": "Gerenciador de downloads pessoal com download segmentado dinâmico, retomada e integração com Chrome/Edge.",
+  "main": "src/main/main.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js",
+    "icon": "node scripts/make-icon.js"
+  },
+  "devDependencies": {
+    "electron": "44.7.2"
+  }
+}
