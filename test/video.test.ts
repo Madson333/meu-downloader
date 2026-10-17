@@ -1,25 +1,24 @@
-'use strict';
-
 // Runs the real yt-dlp from bin/ against the local test server (no internet).
-const { test, before, after } = require('node:test');
-const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const crypto = require('node:crypto');
-const { VideoDownload, toNetscapeCookies } = require('../src/engine/video-download');
-const { DownloadManager } = require('../src/engine/download-manager');
-const { startFileServer } = require('./helpers/file-server');
-const { startStreamServer } = require('./helpers/stream-server');
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { VideoDownload, toNetscapeCookies, type VideoSettings, type VideoTools } from '../src/engine/video-download';
+import { DownloadManager } from '../src/engine/download-manager';
+import type { CookieSource, DownloadView } from '../src/shared/api';
+import { startFileServer, type FileServer } from './helpers/file-server';
+import { startStreamServer } from './helpers/stream-server';
 
-const BIN = path.join(__dirname, '..', 'bin');
+const BIN = path.join(__dirname, '..', '..', 'bin');
 const YTDLP = path.join(BIN, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
 const available = fs.existsSync(YTDLP);
-const tools = { ytdlp: YTDLP, ffmpegDir: BIN, jsRuntime: process.execPath, env: {} };
-const settings = { maxConnections: 4, speedLimitKBps: 0, videoQuality: 'best' };
+const tools: VideoTools = { ytdlp: YTDLP, ffmpegDir: BIN, jsRuntime: process.execPath, env: {} };
+const settings: VideoSettings = { maxConnections: 4, speedLimitKBps: 0 };
 
-let server;
-let tmpRoot;
+let server: FileServer;
+let tmpRoot: string;
 
 before(async () => {
   server = await startFileServer({ size: 4 * 1024 * 1024, bytesPerSecond: 1024 * 1024 });
@@ -31,10 +30,13 @@ after(async () => {
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
-const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-const newDir = () => fs.mkdtempSync(path.join(tmpRoot, 'd-'));
+function sha256(file: string | null | undefined): string {
+  assert.ok(file, 'expected a file path');
+  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+const newDir = (): string => fs.mkdtempSync(path.join(tmpRoot, 'd-'));
 
-function makeVideo(url) {
+function makeVideo(url: string): VideoDownload {
   return new VideoDownload(
     { id: crypto.randomUUID(), url, dir: newDir(), quality: 'best' },
     { tools, getSettings: () => settings },
@@ -50,7 +52,7 @@ test('downloads a video through yt-dlp and reports progress', { skip: !available
   }, 100);
   await d.start();
   clearInterval(timer);
-  assert.equal(d.state.status, 'completed', d.state.error);
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
   assert.equal(sha256(d.state.filePath), server.sha);
   assert.equal(d.state.totalSize, server.body.length);
   assert.ok(sawProgress, 'expected intermediate progress');
@@ -59,7 +61,7 @@ test('downloads a video through yt-dlp and reports progress', { skip: !available
 test('pauses and resumes a video download', { skip: !available && 'bin/yt-dlp ausente' }, async () => {
   const d = makeVideo(`${server.base}/clip.mp4`);
   const running = d.start();
-  for (let i = 0; i < 100 && d.downloaded < 512 * 1024; i++) await new Promise((r) => setTimeout(r, 100));
+  for (let i = 0; i < 100 && d.downloaded < 512 * 1024; i++) await new Promise<void>((r) => setTimeout(r, 100));
   await d.pause();
   await running;
   assert.equal(d.state.status, 'paused');
@@ -70,7 +72,7 @@ test('pauses and resumes a video download', { skip: !available && 'bin/yt-dlp au
   const resumed = new VideoDownload(JSON.parse(JSON.stringify(d.toJSON())), { tools, getSettings: () => settings });
   const before = server.stats.ranges.length;
   await resumed.start();
-  assert.equal(resumed.state.status, 'completed', resumed.state.error);
+  assert.equal(resumed.state.status, 'completed', resumed.state.error ?? undefined);
   assert.equal(sha256(resumed.state.filePath), server.sha);
   assert.ok(server.stats.ranges.slice(before).some(([start]) => start > 0), 'resume should continue the partial file');
 });
@@ -78,7 +80,7 @@ test('pauses and resumes a video download', { skip: !available && 'bin/yt-dlp au
 test('a link that opens a page with a player becomes a video download', { skip: !available && 'bin/yt-dlp ausente' }, async () => {
   const manager = new DownloadManager({ storeDir: newDir(), defaultDownloadDir: newDir(), videoTools: tools });
   const id = manager.add({ url: `${server.base}/player` });
-  const final = await new Promise((resolve) => {
+  const final = await new Promise<DownloadView>((resolve) => {
     manager.on('update', (list) => {
       const d = list.find((x) => x.id === id);
       if (d && (d.status === 'completed' || (d.status === 'error' && d.kind === 'video'))) resolve(d);
@@ -86,7 +88,7 @@ test('a link that opens a page with a player becomes a video download', { skip: 
   });
   await manager.shutdown();
   assert.equal(final.kind, 'video');
-  assert.equal(final.status, 'completed', final.error);
+  assert.equal(final.status, 'completed', final.error ?? undefined);
   assert.equal(sha256(final.filePath), server.sha);
 });
 
@@ -96,14 +98,14 @@ test('cookie sources: the browser session and a cookies.txt reach yt-dlp through
     const body = crypto.randomBytes(256 * 1024);
     streams.set('/clip.mp4', body, { type: 'video/mp4' });
     const sessionDir = newDir();
-    const run = async (cookieSettings, headers) => {
+    const run = async (cookieSettings: Partial<VideoSettings>, headers: Record<string, string>) => {
       const d = new VideoDownload(
         { id: crypto.randomUUID(), url: `${streams.base}/clip.mp4`, dir: newDir(), quality: 'best', headers },
         { tools, getSettings: () => ({ ...settings, ...cookieSettings }), sessionDir },
       );
       const before = streams.log.length;
       await d.start();
-      assert.equal(d.state.status, 'completed', d.state.error);
+      assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
       assert.equal(sha256(d.state.filePath), crypto.createHash('sha256').update(body).digest('hex'));
       assert.deepEqual(fs.readdirSync(sessionDir), [], 'the session file must be deleted');
       return streams.log.slice(before).filter((r) => r.path === '/clip.mp4');
@@ -128,9 +130,10 @@ test('cookie sources: the browser session and a cookies.txt reach yt-dlp through
 
 test('cookie settings are validated', () => {
   const manager = new DownloadManager({ storeDir: newDir(), defaultDownloadDir: newDir() });
-  assert.equal(manager.updateSettings({ videoCookies: 'chrome-secret-db' }).videoCookies, 'none');
+  // An invalid value, as a corrupted settings.json or a tampered IPC call could send.
+  assert.equal(manager.updateSettings({ videoCookies: 'chrome-secret-db' as CookieSource }).videoCookies, 'none');
   assert.equal(manager.updateSettings({ videoCookies: 'file', videoCookiesFile: 'relativo.txt' }).videoCookiesFile, '');
-  assert.equal(toNetscapeCookies('a=1; bad\tname=2; =x', 'https://www.example.com/v').split('\n').length, 3);
+  assert.equal(toNetscapeCookies('a=1; bad\tname=2; =x', 'https://www.example.com/v')?.split('\n').length, 3);
   assert.equal(toNetscapeCookies('', 'https://www.example.com/v'), null);
   clearInterval(manager.timer);
 });

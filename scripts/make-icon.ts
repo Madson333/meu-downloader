@@ -1,11 +1,9 @@
-'use strict';
-
 // Renders assets/icon.png (and the extension icons): a white download arrow on
 // a blue rounded square. Pure Node.js PNG encoder, no dependencies.
 
-const fs = require('node:fs');
-const path = require('node:path');
-const zlib = require('node:zlib');
+import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
 
 const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
   let c = n;
@@ -13,13 +11,13 @@ const CRC_TABLE = Array.from({ length: 256 }, (_, n) => {
   return c >>> 0;
 });
 
-function crc32(buf) {
+function crc32(buf: Buffer): number {
   let c = 0xffffffff;
-  for (const byte of buf) c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
+  for (const byte of buf) c = (CRC_TABLE[(c ^ byte) & 0xff] ?? 0) ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
 
-function chunk(type, data) {
+function chunk(type: string, data: Buffer): Buffer {
   const len = Buffer.alloc(4);
   len.writeUInt32BE(data.length);
   const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
@@ -28,7 +26,7 @@ function chunk(type, data) {
   return Buffer.concat([len, body, crc]);
 }
 
-function encodePng(size, rgba) {
+function encodePng(size: number, rgba: Buffer): Buffer {
   const header = Buffer.alloc(13);
   header.writeUInt32BE(size, 0);
   header.writeUInt32BE(size, 4);
@@ -47,14 +45,14 @@ function encodePng(size, rgba) {
 }
 
 // Shapes in a 0..1 coordinate space.
-function insideRoundedSquare(x, y) {
+function insideRoundedSquare(x: number, y: number): boolean {
   const r = 0.22;
   const cx = Math.min(Math.max(x, r), 1 - r);
   const cy = Math.min(Math.max(y, r), 1 - r);
   return (x - cx) ** 2 + (y - cy) ** 2 <= r * r;
 }
 
-function insideArrow(x, y) {
+function insideArrow(x: number, y: number): boolean {
   const shaft = x >= 0.43 && x <= 0.57 && y >= 0.17 && y <= 0.55;
   // Head: triangle with apex at (0.5, 0.72) and base from 0.25 to 0.75 at y = 0.45.
   const head = y >= 0.45 && y <= 0.72 && Math.abs(x - 0.5) <= (0.72 - y) * (0.25 / 0.27);
@@ -62,7 +60,7 @@ function insideArrow(x, y) {
   return shaft || head || tray;
 }
 
-function render(size) {
+function render(size: number): Buffer {
   const rgba = Buffer.alloc(size * size * 4);
   const samples = 4;
   for (let py = 0; py < size; py++) {
@@ -93,7 +91,8 @@ function render(size) {
   return encodePng(size, rgba);
 }
 
-const root = path.join(__dirname, '..');
+// Compiled to dist/scripts; the icons live at the project root.
+const root = path.join(__dirname, '..', '..');
 fs.mkdirSync(path.join(root, 'assets'), { recursive: true });
 fs.writeFileSync(path.join(root, 'assets', 'icon.png'), render(256));
 fs.mkdirSync(path.join(root, 'extension', 'icons'), { recursive: true });

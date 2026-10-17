@@ -1,9 +1,9 @@
-'use strict';
-
-const fs = require('node:fs');
-const path = require('node:path');
-const { spawn, execFile } = require('node:child_process');
-const { EventEmitter } = require('node:events');
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn, execFile, type ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import type { Quality, Settings } from '../shared/api';
+import type { BaseState, Download, InitialState } from './types';
 
 // Sites that serve a player page instead of a file. Any other site still
 // reaches yt-dlp when its link turns out to be a web page.
@@ -14,7 +14,7 @@ const VIDEO_HOSTS = [
   'pinterest.com', 'threads.net', 'odysee.com', 'globo.com', 'globoplay.globo.com',
 ];
 
-function isVideoPageUrl(url) {
+export function isVideoPageUrl(url: string): boolean {
   try {
     const host = new URL(url).hostname.toLowerCase();
     return VIDEO_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
@@ -23,9 +23,13 @@ function isVideoPageUrl(url) {
   }
 }
 
-const QUALITIES = ['best', '2160', '1440', '1080', '720', '480', '360', 'audio'];
+export const QUALITIES: readonly Quality[] = ['best', '2160', '1440', '1080', '720', '480', '360', 'audio'];
 
-function formatArgs(quality) {
+export function isQuality(value: unknown): value is Quality {
+  return QUALITIES.includes(value as Quality);
+}
+
+function formatArgs(quality: Quality): string[] {
   if (quality === 'audio') return ['-f', 'ba/b', '-x', '--audio-format', 'mp3', '--audio-quality', '0'];
   // `res` is the smaller dimension, so "1080p" also means 1080x1920 for vertical videos.
   // -S res:N prefers the largest resolution not above N; H.264/AAC win among equals.
@@ -37,7 +41,7 @@ function formatArgs(quality) {
  * Netscape cookies.txt for yt-dlp from a Cookie header. Every cookie is
  * host-only for the page's host, so yt-dlp never sends them to other sites.
  */
-function toNetscapeCookies(cookieHeader, url) {
+export function toNetscapeCookies(cookieHeader: string | null | undefined, url: string): string | null {
   const { hostname, protocol } = new URL(url);
   const lines = ['# Netscape HTTP Cookie File'];
   for (const pair of String(cookieHeader ?? '').split(';')) {
@@ -51,10 +55,49 @@ function toNetscapeCookies(cookieHeader, url) {
   return lines.length > 1 ? `${lines.join('\n')}\n` : null;
 }
 
-function killTree(child) {
+export function killTree(child: ChildProcess | null): void {
   if (!child || child.exitCode !== null) return;
   if (process.platform === 'win32') execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
   else child.kill('SIGTERM');
+}
+
+/** yt-dlp and where it finds ffmpeg and a JavaScript runtime. */
+export interface VideoTools {
+  ytdlp: string;
+  ffmpegDir: string;
+  jsRuntime: string;
+  env: NodeJS.ProcessEnv;
+}
+
+/** The settings a video download reads; cookie options are optional. */
+export type VideoSettings = Pick<Settings, 'maxConnections' | 'speedLimitKBps'>
+  & Partial<Pick<Settings, 'videoCookies' | 'videoCookiesFile'>>;
+
+interface StreamProgress {
+  downloaded: number;
+  total: number | null;
+  tmp?: string | null;
+  file?: string | null;
+}
+
+export interface VideoState extends BaseState {
+  kind: 'video';
+  quality: Quality;
+  segments: [];
+  /** Persisted so progress and partial files survive a restart. */
+  streams: Record<string, StreamProgress>;
+  videoId?: string;
+}
+
+/** The fields of yt-dlp's progress JSON that are used here. */
+interface YtDlpProgress {
+  status?: string;
+  filename?: string;
+  tmpfilename?: string;
+  downloaded_bytes?: number;
+  total_bytes?: number;
+  total_bytes_estimate?: number;
+  fragment_count?: number;
 }
 
 /**
@@ -62,31 +105,40 @@ function killTree(child) {
  * the manager and interface treat both alike. yt-dlp keeps `.part` files, so
  * pausing kills the process and resuming runs it again with --continue.
  */
-class VideoDownload extends EventEmitter {
-  constructor(state, { tools, getSettings, sessionDir = null }) {
+export class VideoDownload extends EventEmitter implements Download {
+  readonly state: VideoState;
+  private readonly tools: VideoTools | null;
+  private readonly getSettings: () => VideoSettings;
+  private readonly sessionDir: string | null;
+  private cookieFile: string | null = null;
+  private child: ChildProcess | null = null;
+  private running: Promise<void> | null = null;
+  private connections = 0;
+  private pauseRequested = false;
+
+  constructor(state: InitialState<VideoState>, { tools, getSettings, sessionDir = null }: {
+    tools: VideoTools | null;
+    getSettings: () => VideoSettings;
+    sessionDir?: string | null;
+  }) {
     super();
-    // `streams` is persisted so progress and partial files survive a restart.
-    this.state = { status: 'queued', segments: [], streams: {}, totalSize: null, error: null, quality: 'best', ...state, kind: 'video' };
+    this.state = { status: 'queued', streams: {}, totalSize: null, error: null, quality: 'best', ...state, segments: [], kind: 'video' };
     this.tools = tools;
     this.getSettings = getSettings;
     this.sessionDir = sessionDir;
-    this.cookieFile = null;
-    this.child = null;
-    this.running = null;
-    this.connections = 0;
   }
 
-  get downloaded() {
+  get downloaded(): number {
     let sum = 0;
     for (const s of Object.values(this.state.streams)) sum += s.downloaded;
     return sum;
   }
 
-  get activeConnections() {
+  get activeConnections(): number {
     return this.connections;
   }
 
-  #setStatus(status, error = null) {
+  #setStatus(status: VideoState['status'], error: string | null = null): void {
     this.state.status = status;
     this.state.error = error;
     if (status !== 'downloading') this.state.phase = null;
@@ -98,18 +150,19 @@ class VideoDownload extends EventEmitter {
    * arguments for it. yt-dlp rewrites its cookie file on exit, so a user's
    * cookies.txt is copied first and the copy is deleted afterwards.
    */
-  #cookieArgs() {
+  #cookieArgs(): string[] {
     const { videoCookies, videoCookiesFile } = this.getSettings();
     if (videoCookies === 'firefox') return ['--cookies-from-browser', 'firefox'];
     if (videoCookies !== 'browser' && videoCookies !== 'file') return [];
     if (!this.sessionDir) return [];
-    let content;
+    let content: string | Buffer;
     if (videoCookies === 'browser') {
-      content = toNetscapeCookies(this.state.headers?.cookie, this.state.url);
-      if (!content) return [];
+      const netscape = toNetscapeCookies(this.state.headers?.cookie, this.state.url);
+      if (!netscape) return [];
+      content = netscape;
     } else {
-      const stat = videoCookiesFile ? fs.statSync(videoCookiesFile, { throwIfNoEntry: false }) : null;
-      if (!stat?.isFile()) throw new Error('Arquivo de cookies não encontrado; escolha-o de novo em Configurações');
+      const stat = videoCookiesFile ? fs.statSync(videoCookiesFile, { throwIfNoEntry: false }) : undefined;
+      if (!videoCookiesFile || !stat?.isFile()) throw new Error('Arquivo de cookies não encontrado; escolha-o de novo em Configurações');
       if (stat.size > 10 * 1024 * 1024) throw new Error('Arquivo de cookies grande demais');
       content = fs.readFileSync(videoCookiesFile);
     }
@@ -119,20 +172,20 @@ class VideoDownload extends EventEmitter {
     return ['--cookies', this.cookieFile];
   }
 
-  #removeCookieFile() {
+  #removeCookieFile(): void {
     if (this.cookieFile) fs.rmSync(this.cookieFile, { force: true });
     this.cookieFile = null;
   }
 
-  #args() {
+  #args(tools: VideoTools): string[] {
     const settings = this.getSettings();
     const args = [
       '--newline', '--progress', '--no-colors', '--encoding', 'utf-8',
       '--no-playlist', '--continue', '--no-mtime', '--windows-filenames',
       '--retries', '10', '--fragment-retries', '10',
       '--concurrent-fragments', String(settings.maxConnections),
-      '--ffmpeg-location', this.tools.ffmpegDir,
-      '--js-runtimes', `node:${this.tools.jsRuntime}`,
+      '--ffmpeg-location', tools.ffmpegDir,
+      '--js-runtimes', `node:${tools.jsRuntime}`,
       '-P', this.state.dir,
       '-o', '%(title).150B [%(id)s].%(ext)s',
       '--progress-template', 'download:MDPROG %(progress)j',
@@ -147,7 +200,7 @@ class VideoDownload extends EventEmitter {
     return args;
   }
 
-  start() {
+  start(): Promise<void> {
     if (this.running) return this.running;
     if (!this.tools) {
       this.#setStatus('error', 'yt-dlp não encontrado na pasta bin do app');
@@ -155,43 +208,43 @@ class VideoDownload extends EventEmitter {
     }
     this.pauseRequested = false;
     this.#setStatus('downloading');
-    this.running = this.#run().finally(() => {
+    this.running = this.#run(this.tools).finally(() => {
       this.running = null;
     });
     return this.running;
   }
 
-  #run() {
+  #run(tools: VideoTools): Promise<void> {
     return new Promise((resolve) => {
       fs.mkdirSync(this.state.dir, { recursive: true });
-      let args;
+      let args: string[];
       try {
-        args = this.#args();
+        args = this.#args(tools);
       } catch (err) {
         this.#removeCookieFile();
-        this.#setStatus('error', err.message);
+        this.#setStatus('error', err instanceof Error ? err.message : String(err));
         resolve();
         return;
       }
-      const child = spawn(this.tools.ytdlp, args, {
+      const child = spawn(tools.ytdlp, args, {
         windowsHide: true,
-        env: { ...process.env, ...this.tools.env, PYTHONIOENCODING: 'utf-8' },
+        env: { ...process.env, ...tools.env, PYTHONIOENCODING: 'utf-8' },
       });
       this.child = child;
       this.connections = 1;
-      let lastError = null;
+      let lastError: string | null = null;
       let buffer = '';
-      const onLine = (line) => {
+      const onLine = (line: string): void => {
         if (line.startsWith('MDPROG ')) this.#onProgress(line.slice(7));
         else if (line.startsWith('MDINFO ')) this.#onInfo(line.slice(7));
         else if (line.startsWith('MDFILE ')) this.state.filePath = line.slice(7).trim();
         else if (/^ERROR:/.test(line)) lastError = line.replace(/^ERROR:\s*(\[[^\]]+\]\s*)?/, '');
         else if (/^\[Merger\]|^\[ExtractAudio\]|^\[VideoConvertor\]/.test(line)) this.#phase('Juntando áudio e vídeo…');
       };
-      const read = (chunk) => {
+      const read = (chunk: Buffer): void => {
         buffer += chunk.toString('utf8');
         const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop();
+        buffer = lines.pop() ?? '';
         for (const line of lines) onLine(line.trim());
       };
       child.stdout.on('data', read);
@@ -204,34 +257,35 @@ class VideoDownload extends EventEmitter {
         this.#removeCookieFile();
         this.child = null;
         this.connections = 0;
+        const filePath = this.state.filePath;
         if (this.pauseRequested) this.#setStatus('paused');
-        else if (code === 0 && this.state.filePath && fs.existsSync(this.state.filePath)) this.#finish();
+        else if (code === 0 && filePath && fs.existsSync(filePath)) this.#finish(filePath);
         else this.#setStatus('error', lastError || `yt-dlp terminou com código ${code}`);
         resolve();
       });
     });
   }
 
-  #phase(text) {
+  #phase(text: string): void {
     this.state.phase = text;
     this.emit('change', this);
   }
 
-  #onInfo(json) {
+  #onInfo(json: string): void {
     try {
-      const info = JSON.parse(json);
+      const info = JSON.parse(json) as { id?: string; title?: string };
       if (info.title) this.state.fileName = info.title;
-      this.state.videoId = info.id ?? this.state.videoId;
+      if (info.id) this.state.videoId = info.id;
       this.emit('change', this);
     } catch {
       // Ignore malformed lines; progress keeps working without the title.
     }
   }
 
-  #onProgress(json) {
-    let p;
+  #onProgress(json: string): void {
+    let p: YtDlpProgress;
     try {
-      p = JSON.parse(json);
+      p = JSON.parse(json) as YtDlpProgress;
     } catch {
       return;
     }
@@ -244,14 +298,13 @@ class VideoDownload extends EventEmitter {
       file: p.filename ?? null,
     };
     const totals = Object.values(this.state.streams).map((s) => s.total);
-    this.state.totalSize = totals.every(Boolean) ? totals.reduce((a, b) => a + b, 0) : null;
+    this.state.totalSize = totals.every(Boolean) ? totals.reduce<number>((a, b) => a + (b ?? 0), 0) : null;
     this.connections = p.status !== 'downloading' ? 0
       : p.fragment_count ? Math.min(this.getSettings().maxConnections, p.fragment_count) : 1;
     if (this.state.phase) this.state.phase = null;
   }
 
-  #finish() {
-    const filePath = this.state.filePath;
+  #finish(filePath: string): void {
     this.state.fileName = path.basename(filePath);
     this.state.totalSize = fs.statSync(filePath).size;
     this.state.streams = { final: { downloaded: this.state.totalSize, total: this.state.totalSize } };
@@ -259,7 +312,7 @@ class VideoDownload extends EventEmitter {
     this.#setStatus('completed');
   }
 
-  async pause() {
+  async pause(): Promise<void> {
     if (!this.running) {
       if (this.state.status !== 'completed') this.#setStatus('paused');
       return;
@@ -270,8 +323,8 @@ class VideoDownload extends EventEmitter {
   }
 
   /** Removes the partial files this download created. */
-  async discardTemp() {
-    const names = new Set();
+  async discardTemp(): Promise<void> {
+    const names = new Set<string>();
     for (const s of Object.values(this.state.streams)) {
       for (const f of [s.tmp, s.file]) if (f) names.add(path.resolve(this.state.dir, f));
     }
@@ -282,19 +335,17 @@ class VideoDownload extends EventEmitter {
     }
   }
 
-  toJSON() {
+  toJSON(): VideoState {
     const { status, ...rest } = this.state;
     return { ...rest, status: status === 'downloading' ? 'paused' : status, segments: [] };
   }
 }
 
 /** Runs `yt-dlp -U` and resolves with its output. */
-function updateYtDlp(tools) {
+export function updateYtDlp(tools: VideoTools): Promise<string> {
   return new Promise((resolve) => {
     execFile(tools.ytdlp, ['-U'], { windowsHide: true, timeout: 120_000 }, (err, stdout, stderr) => {
       resolve(`${stdout}${stderr}`.trim() || err?.message || 'Sem resposta do yt-dlp');
     });
   });
 }
-
-module.exports = { VideoDownload, isVideoPageUrl, updateYtDlp, killTree, toNetscapeCookies, QUALITIES };

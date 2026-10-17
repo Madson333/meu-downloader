@@ -1,0 +1,17 @@
+{
+  // Chrome/Edge extension. Compiles src/*.ts into this folder, which is the one
+  // loaded with "Load unpacked".
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": ["chrome"],
+    "rootDir": "src",
+    "outDir": ".",
+    "sourceMap": false
+  },
+  "include": ["src"],
+  // Without this, TypeScript excludes the outDir, which here contains src.
+  "exclude": []
+}

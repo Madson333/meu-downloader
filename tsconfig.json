@@ -1,0 +1,13 @@
+{
+  // Main process, download engine, tests and scripts (Node.js, CommonJS).
+  // The renderer and the browser extension have their own tsconfig.json.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+    "rootDir": ".",
+    "outDir": "dist"
+  },
+  "include": ["src/engine", "src/main", "src/shared", "test", "scripts"]
+}

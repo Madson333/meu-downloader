@@ -2,15 +2,21 @@
   "name": "meu-downloader",
   "version": "1.0.0",
   "description": "Gerenciador de downloads pessoal com download segmentado dinâmico, retomada e integração com Chrome/Edge.",
-  "main": "src/main/main.js",
+  "main": "dist/src/main/main.js",
   "private": true,
   "license": "MIT",
   "scripts": {
-    "start": "electron .",
-    "test": "node --test test/*.test.js",
-    "icon": "node scripts/make-icon.js"
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.json && tsc -p src/renderer/tsconfig.json && tsc -p extension/tsconfig.json && node dist/scripts/copy-assets.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p src/renderer/tsconfig.json --noEmit && tsc -p extension/tsconfig.json --noEmit",
+    "start": "npm run build && electron .",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "icon": "npm run build && node dist/scripts/make-icon.js"
   },
   "devDependencies": {
-    "electron": "44.7.2"
+    "@types/chrome": "0.3.4",
+    "@types/node": "22.20.5",
+    "electron": "44.7.2",
+    "typescript": "7.0.2"
   }
 }

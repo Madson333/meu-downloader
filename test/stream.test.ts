@@ -1,31 +1,30 @@
-'use strict';
-
 // Stream downloads against a local server. Tests marked "ffmpeg" generate real
 // media with bin/ffmpeg and are skipped when it is missing.
-const { test, before, after } = require('node:test');
-const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const crypto = require('node:crypto');
-const { spawnSync } = require('node:child_process');
-const { StreamDownload } = require('../src/engine/stream-download');
-const { SpeedLimiter } = require('../src/engine/speed-limiter');
-const { DownloadManager } = require('../src/engine/download-manager');
-const { request } = require('../src/engine/http-client');
-const { probeStreams } = require('../src/engine/ffmpeg');
-const { startStreamServer } = require('./helpers/stream-server');
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { StreamDownload } from '../src/engine/stream-download';
+import { SpeedLimiter } from '../src/engine/speed-limiter';
+import { DownloadManager } from '../src/engine/download-manager';
+import { request } from '../src/engine/http-client';
+import { probeStreams, type StreamTools } from '../src/engine/ffmpeg';
+import { startStreamServer, type RouteOptions, type StreamServer } from './helpers/stream-server';
+import type { DownloadView, Quality } from '../src/shared/api';
 
-const BIN = path.join(__dirname, '..', 'bin');
-const exe = (name) => path.join(BIN, process.platform === 'win32' ? `${name}.exe` : name);
+const BIN = path.join(__dirname, '..', '..', 'bin');
+const exe = (name: string): string => path.join(BIN, process.platform === 'win32' ? `${name}.exe` : name);
 const FFMPEG = exe('ffmpeg');
 const FFPROBE = exe('ffprobe');
 const hasFfmpeg = fs.existsSync(FFMPEG) && fs.existsSync(FFPROBE);
-const tools = hasFfmpeg ? { ffmpeg: FFMPEG, ffprobe: FFPROBE } : null;
+const tools: StreamTools | null = hasFfmpeg ? { ffmpeg: FFMPEG, ffprobe: FFPROBE } : null;
 const noFfmpeg = !hasFfmpeg && 'bin/ffmpeg ausente';
 
-let server;
-let tmpRoot;
+let server: StreamServer;
+let tmpRoot: string;
 
 before(async () => {
   server = await startStreamServer();
@@ -37,10 +36,25 @@ after(async () => {
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
-const newDir = () => fs.mkdtempSync(path.join(tmpRoot, 'd-'));
-const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
+const newDir = (): string => fs.mkdtempSync(path.join(tmpRoot, 'd-'));
+const sha = (buf: Buffer): string => crypto.createHash('sha256').update(buf).digest('hex');
 
-function makeStream(url, { quality = 'best', connections = 4, withTools = null, headers = {}, dir = newDir() } = {}) {
+/** The final file of a finished download, failing the test when there is none. */
+function output(d: { state: { filePath?: string | null } } | DownloadView): string {
+  const file = 'state' in d ? d.state.filePath : d.filePath;
+  assert.ok(file, 'expected a final file');
+  return file;
+}
+
+interface StreamTestOptions {
+  quality?: Quality;
+  connections?: number;
+  withTools?: StreamTools | null;
+  headers?: Record<string, string>;
+  dir?: string;
+}
+
+function makeStream(url: string, { quality = 'best', connections = 4, withTools = null, headers = {}, dir = newDir() }: StreamTestOptions = {}): StreamDownload {
   return new StreamDownload(
     { id: crypto.randomUUID(), url, dir, quality, headers },
     { limiter: new SpeedLimiter(0), getMaxConnections: () => connections, tools: withTools },
@@ -48,7 +62,7 @@ function makeStream(url, { quality = 'best', connections = 4, withTools = null, 
 }
 
 /** Registers `count` random segments under prefix and returns them. */
-function addSegments(prefix, count, { size = 40 * 1024, ext = 'ts', ...options } = {}) {
+function addSegments(prefix: string, count: number, { size = 40 * 1024, ext = 'ts', ...options }: RouteOptions & { size?: number; ext?: string } = {}): Buffer[] {
   return Array.from({ length: count }, (_, i) => {
     const body = crypto.randomBytes(size);
     server.set(`${prefix}/seg${i}.${ext}`, body, options);
@@ -56,9 +70,9 @@ function addSegments(prefix, count, { size = 40 * 1024, ext = 'ts', ...options }
   });
 }
 
-function mediaPlaylist(count, { ext = 'ts', extra = '', live = false, names = null } = {}) {
+function mediaPlaylist(count: number, { ext = 'ts', extra = '', live = false, names = null }: { ext?: string; extra?: string; live?: boolean; names?: string[] | null } = {}): string {
   const lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:2', extra];
-  for (let i = 0; i < count; i++) lines.push('#EXTINF:2.0,', names ? names[i] : `seg${i}.${ext}`);
+  for (let i = 0; i < count; i++) lines.push('#EXTINF:2.0,', names?.[i] ?? `seg${i}.${ext}`);
   if (!live) lines.push('#EXT-X-ENDLIST');
   return lines.filter(Boolean).join('\n');
 }
@@ -68,9 +82,9 @@ test('HLS media playlist: downloads every segment and keeps their order', async 
   server.set('/a/index.m3u8', mediaPlaylist(12));
   const d = makeStream(`${server.base}/a/index.m3u8`);
   await d.start();
-  assert.equal(d.state.status, 'completed', d.state.error);
-  assert.equal(path.extname(d.state.filePath), '.ts');
-  assert.equal(sha(fs.readFileSync(d.state.filePath)), sha(Buffer.concat(segs)));
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
+  assert.equal(path.extname(output(d)), '.ts');
+  assert.equal(sha(fs.readFileSync(output(d))), sha(Buffer.concat(segs)));
   assert.deepEqual(d.state.chunks, { done: 12, total: 12 });
   assert.equal(d.state.totalSize, Buffer.concat(segs).length);
   assert.ok(!fs.existsSync(d.tempDir), 'temporary folder must be removed');
@@ -78,7 +92,7 @@ test('HLS media playlist: downloads every segment and keeps their order', async 
 });
 
 test('HLS master playlist: downloads only the variant of the requested quality', async () => {
-  const variants = {};
+  const variants: Record<number, Buffer[]> = {};
   for (const h of [360, 720, 1080]) {
     variants[h] = addSegments(`/b/${h}`, 3);
     server.set(`/b/${h}/index.m3u8`, mediaPlaylist(3));
@@ -96,17 +110,17 @@ test('HLS master playlist: downloads only the variant of the requested quality',
   const before = server.log.length;
   const d = makeStream(`${server.base}/b/master.m3u8`, { quality: '720' });
   await d.start();
-  assert.equal(d.state.status, 'completed', d.state.error);
-  assert.equal(sha(fs.readFileSync(d.state.filePath)), sha(Buffer.concat(variants[720])));
-  assert.match(d.state.selection.video, /^720p/);
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
+  assert.equal(sha(fs.readFileSync(output(d))), sha(Buffer.concat(variants[720])));
+  assert.match(d.state.selection?.video ?? '', /^720p/);
   const fetched = server.log.slice(before).map((r) => r.path).filter((p) => p.endsWith('.ts'));
   assert.ok(fetched.every((p) => p.startsWith('/b/720/')), fetched.join(','));
   assert.equal(d.state.fileName, 'b.ts');
 
   const fallback = makeStream(`${server.base}/b/master.m3u8`, { quality: '1440' });
   await fallback.start();
-  assert.equal(fallback.state.status, 'completed', fallback.state.error);
-  assert.match(fallback.state.selection.video, /^1080p/);
+  assert.equal(fallback.state.status, 'completed', fallback.state.error ?? undefined);
+  assert.match(fallback.state.selection?.video ?? '', /^1080p/);
   assert.ok(fallback.state.notices.some((n) => /1440p não está disponível; usado 1080p/.test(n)));
 });
 
@@ -123,16 +137,16 @@ test('HLS byte ranges are requested and joined exactly', async () => {
   const before = server.log.length;
   const d = makeStream(`${server.base}/c/index.m3u8`);
   await d.start();
-  assert.equal(d.state.status, 'completed', d.state.error);
-  assert.equal(sha(fs.readFileSync(d.state.filePath)), sha(file));
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
+  assert.equal(sha(fs.readFileSync(output(d))), sha(file));
   const ranges = server.log.slice(before).filter((r) => r.path === '/c/all.ts').map((r) => r.range).sort();
   assert.deepEqual(ranges, ['bytes=0-99999', 'bytes=100000-199999', 'bytes=200000-307199']);
   assert.equal(d.state.sizeEstimated, false);
 });
 
 /** A minimal, unencrypted MP4 init segment (ftyp + moov). */
-function fakeInit(sampleEntry = 'avc1') {
-  const box = (type, payload = Buffer.alloc(0)) => {
+function fakeInit(sampleEntry = 'avc1'): Buffer {
+  const box = (type: string, payload: Buffer = Buffer.alloc(0)): Buffer => {
     const header = Buffer.alloc(8);
     header.writeUInt32BE(8 + payload.length, 0);
     header.write(type, 4, 'latin1');
@@ -148,9 +162,9 @@ test('HLS fMP4: the EXT-X-MAP init segment comes first', async () => {
   server.set('/d/index.m3u8', mediaPlaylist(3, { ext: 'm4s', extra: '#EXT-X-MAP:URI="init.mp4"' }));
   const d = makeStream(`${server.base}/d/index.m3u8`);
   await d.start();
-  assert.equal(d.state.status, 'completed', d.state.error);
-  assert.equal(path.extname(d.state.filePath), '.mp4');
-  assert.equal(sha(fs.readFileSync(d.state.filePath)), sha(Buffer.concat([init, ...segs])));
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
+  assert.equal(path.extname(output(d)), '.mp4');
+  assert.equal(sha(fs.readFileSync(output(d))), sha(Buffer.concat([init, ...segs])));
 });
 
 test('HLS AES-128 segments are decrypted with the key from the manifest', async () => {
@@ -168,8 +182,8 @@ test('HLS AES-128 segments are decrypted with the key from the manifest', async 
   server.set('/e/index.m3u8', mediaPlaylist(4, { extra: '#EXT-X-MEDIA-SEQUENCE:7\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"' }));
   const d = makeStream(`${server.base}/e/index.m3u8`);
   await d.start();
-  assert.equal(d.state.status, 'completed', d.state.error);
-  assert.equal(sha(fs.readFileSync(d.state.filePath)), sha(Buffer.concat(plain)));
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
+  assert.equal(sha(fs.readFileSync(output(d))), sha(Buffer.concat(plain)));
   assert.equal(server.requests('/e/key.bin').length, 1, 'the key is fetched once');
 });
 
@@ -179,8 +193,8 @@ test('temporary HTTP failures are retried', async () => {
   server.set('/f/index.m3u8', mediaPlaylist(3));
   const d = makeStream(`${server.base}/f/index.m3u8`);
   await d.start();
-  assert.equal(d.state.status, 'completed', d.state.error);
-  assert.equal(sha(fs.readFileSync(d.state.filePath)), sha(Buffer.concat(segs)));
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
+  assert.equal(sha(fs.readFileSync(output(d))), sha(Buffer.concat(segs)));
   assert.equal(server.requests('/f/seg1.ts').length, 3);
 });
 
@@ -191,7 +205,7 @@ test('a missing segment fails with a clear message and can be resumed later', as
   const d = makeStream(`${server.base}/g/index.m3u8`, { connections: 1 });
   await d.start();
   assert.equal(d.state.status, 'error');
-  assert.match(d.state.error, /Segmento 3 de 5: O servidor respondeu HTTP 404/);
+  assert.match(d.state.error ?? '', /Segmento 3 de 5: O servidor respondeu HTTP 404/);
 
   // Once the server has it, resuming downloads only what is missing.
   server.set('/g/seg2.ts', segs[2]);
@@ -200,9 +214,9 @@ test('a missing segment fails with a clear message and can be resumed later', as
     limiter: new SpeedLimiter(0), getMaxConnections: () => 2, tools: null,
   });
   await resumed.start();
-  assert.equal(resumed.state.status, 'completed', resumed.state.error);
+  assert.equal(resumed.state.status, 'completed', resumed.state.error ?? undefined);
   assert.equal(server.requests('/g/seg0.ts').length, before, 'finished segments are not downloaded again');
-  assert.equal(sha(fs.readFileSync(resumed.state.filePath)), sha(Buffer.concat(segs)));
+  assert.equal(sha(fs.readFileSync(output(resumed))), sha(Buffer.concat(segs)));
 });
 
 test('pauses and resumes from the persisted state', async () => {
@@ -210,7 +224,7 @@ test('pauses and resumes from the persisted state', async () => {
   server.set('/h/index.m3u8', mediaPlaylist(30));
   const d = makeStream(`${server.base}/h/index.m3u8`, { connections: 2 });
   const running = d.start();
-  for (let i = 0; i < 100 && d.state.chunks.done < 6; i++) await new Promise((r) => setTimeout(r, 50));
+  for (let i = 0; i < 100 && d.state.chunks.done < 6; i++) await new Promise<void>((r) => setTimeout(r, 50));
   await d.pause();
   await running;
   assert.equal(d.state.status, 'paused');
@@ -222,8 +236,8 @@ test('pauses and resumes from the persisted state', async () => {
   const before = server.requests('/h/seg').length;
   const resumed = new StreamDownload(saved, { limiter: new SpeedLimiter(0), getMaxConnections: () => 4, tools: null });
   await resumed.start();
-  assert.equal(resumed.state.status, 'completed', resumed.state.error);
-  assert.equal(sha(fs.readFileSync(resumed.state.filePath)), sha(Buffer.concat(segs)));
+  assert.equal(resumed.state.status, 'completed', resumed.state.error ?? undefined);
+  assert.equal(sha(fs.readFileSync(output(resumed))), sha(Buffer.concat(segs)));
   assert.ok(server.requests('/h/seg').length - before <= 30 - done + 2, 'only missing segments are fetched');
 });
 
@@ -232,7 +246,7 @@ test('a manifest that changed while paused restarts the download', async () => {
   server.set('/i/index.m3u8', mediaPlaylist(20));
   const d = makeStream(`${server.base}/i/index.m3u8`, { connections: 1 });
   const running = d.start();
-  for (let i = 0; i < 100 && d.state.chunks.done < 2; i++) await new Promise((r) => setTimeout(r, 50));
+  for (let i = 0; i < 100 && d.state.chunks.done < 2; i++) await new Promise<void>((r) => setTimeout(r, 50));
   await d.pause();
   await running;
 
@@ -246,9 +260,9 @@ test('a manifest that changed while paused restarts the download', async () => {
     limiter: new SpeedLimiter(0), getMaxConnections: () => 4, tools: null,
   });
   await resumed.start();
-  assert.equal(resumed.state.status, 'completed', resumed.state.error);
+  assert.equal(resumed.state.status, 'completed', resumed.state.error ?? undefined);
   assert.ok(resumed.state.notices.some((n) => /mudou/.test(n)));
-  assert.equal(sha(fs.readFileSync(resumed.state.filePath)), sha(Buffer.concat(fresh)));
+  assert.equal(sha(fs.readFileSync(output(resumed))), sha(Buffer.concat(fresh)));
 });
 
 test('DRM-protected and live streams are refused', async () => {
@@ -259,7 +273,7 @@ test('DRM-protected and live streams are refused', async () => {
   await drm.start();
   assert.equal(drm.state.status, 'error');
   assert.equal(drm.state.errorCode, 'DRM');
-  assert.match(drm.state.error, /DRM/);
+  assert.match(drm.state.error ?? '', /DRM/);
   assert.ok(!fs.existsSync(drm.tempDir));
 
   // Encryption declared only inside the MP4 init segment.
@@ -282,7 +296,7 @@ test('DRM-protected and live streams are refused', async () => {
   await live.start();
   assert.equal(live.state.status, 'error');
   assert.equal(live.state.errorCode, 'LIVE');
-  assert.match(live.state.error, /ao vivo/);
+  assert.match(live.state.error ?? '', /ao vivo/);
 });
 
 test('cookies are sent only to the manifest host', async () => {
@@ -293,20 +307,20 @@ test('cookies are sent only to the manifest host', async () => {
   const before = server.log.length;
   const d = makeStream(`${server.base}/k/index.m3u8`, { headers: { cookie: 'session=secret' } });
   await d.start();
-  assert.equal(d.state.status, 'completed', d.state.error);
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
   const requests = server.log.slice(before).filter((r) => r.path.startsWith('/k/'));
   for (const r of requests) {
-    if (r.host.startsWith('localhost')) assert.equal(r.cookie, null, `${r.host}${r.path} received the cookie`);
+    if (r.host?.startsWith('localhost')) assert.equal(r.cookie, null, `${r.host}${r.path} received the cookie`);
     else assert.equal(r.cookie, 'session=secret');
   }
-  assert.ok(requests.some((r) => r.host.startsWith('localhost')));
+  assert.ok(requests.some((r) => r.host?.startsWith('localhost')));
 });
 
 test('a public manifest cannot reach internal addresses', async () => {
-  await assert.rejects(request(`${server.base}/a/index.m3u8`, { blockPrivate: true }), (err) => err.code === 'BLOCKED_ADDRESS');
+  await assert.rejects(request(`${server.base}/a/index.m3u8`, { blockPrivate: true }), (err: unknown) => (err as { code?: string }).code === 'BLOCKED_ADDRESS');
   await assert.rejects(
     request(`http://localhost:${server.port}/a/index.m3u8`, { blockPrivate: true }),
-    (err) => err.code === 'BLOCKED_ADDRESS',
+    (err: unknown) => (err as { code?: string }).code === 'BLOCKED_ADDRESS',
   );
 });
 
@@ -324,11 +338,11 @@ test('WebVTT subtitles are joined and saved next to the video', async () => {
   ].join('\n'));
   const d = makeStream(`${server.base}/l/master.m3u8`);
   await d.start();
-  assert.equal(d.state.status, 'completed', d.state.error);
-  assert.equal(sha(fs.readFileSync(d.state.filePath)), sha(Buffer.concat(segs)));
-  assert.deepEqual(d.state.selection.subtitles, ['Português']);
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
+  assert.equal(sha(fs.readFileSync(output(d))), sha(Buffer.concat(segs)));
+  assert.deepEqual(d.state.selection?.subtitles, ['Português']);
   const vtt = fs.readFileSync(path.join(d.state.dir, 'l.pt.vtt'), 'utf8');
-  assert.equal(vtt.match(/WEBVTT/g).length, 1);
+  assert.equal(vtt.match(/WEBVTT/g)?.length, 1);
   assert.match(vtt, /Olá[\s\S]*00:00:02.000 --> 00:00:03.000\nMundo/);
 });
 
@@ -358,17 +372,17 @@ test('DASH audio-only quality saves the audio representation', async () => {
 </MPD>`);
   const d = makeStream(`${server.base}/m/manifest.mpd`, { quality: 'audio' });
   await d.start();
-  assert.equal(d.state.status, 'completed', d.state.error);
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
   assert.equal(d.state.protocol, 'dash');
-  assert.equal(path.extname(d.state.filePath), '.m4a');
-  assert.equal(sha(fs.readFileSync(d.state.filePath)), sha(Buffer.concat([init, ...segs])));
+  assert.equal(path.extname(output(d)), '.m4a');
+  assert.equal(sha(fs.readFileSync(output(d))), sha(Buffer.concat([init, ...segs])));
 });
 
 // ---------------------------------------------------------------- manager
 
-function waitFor(manager, id, predicate) {
+function waitFor(manager: DownloadManager, id: string, predicate: (d: DownloadView) => boolean): Promise<DownloadView> {
   return new Promise((resolve) => {
-    const check = (list) => {
+    const check = (list: DownloadView[]): void => {
       const d = list.find((x) => x.id === id);
       if (d && predicate(d)) {
         manager.off('update', check);
@@ -385,9 +399,9 @@ test('manager: .m3u8 links and manifests without extension become streams', asyn
   server.set('/n/play', mediaPlaylist(3), { type: 'application/vnd.apple.mpegurl' });
   const manager = new DownloadManager({ storeDir: newDir(), defaultDownloadDir: newDir() });
   const direct = manager.add({ url: `${server.base}/n/index.m3u8` });
-  assert.equal(manager.list().find((d) => d.id === direct).kind, 'stream');
+  assert.equal(manager.list().find((d) => d.id === direct)?.kind, 'stream');
   const sniffed = manager.add({ url: `${server.base}/n/play` });
-  assert.equal(manager.list().find((d) => d.id === sniffed).kind, 'file');
+  assert.equal(manager.list().find((d) => d.id === sniffed)?.kind, 'file');
 
   const [a, b] = await Promise.all([
     waitFor(manager, direct, (d) => ['completed', 'error'].includes(d.status)),
@@ -395,8 +409,8 @@ test('manager: .m3u8 links and manifests without extension become streams', asyn
   ]);
   await manager.shutdown();
   for (const d of [a, b]) {
-    assert.equal(d.status, 'completed', d.error);
-    assert.equal(sha(fs.readFileSync(d.filePath)), sha(Buffer.concat(segs)));
+    assert.equal(d.status, 'completed', d.error ?? undefined);
+    assert.equal(sha(fs.readFileSync(output(d))), sha(Buffer.concat(segs)));
   }
 });
 
@@ -407,8 +421,8 @@ test('manager: a plain M3U list is saved as a file, not treated as a stream', as
   const id = manager.add({ url: `${server.base}/o/canais.m3u8` });
   const d = await waitFor(manager, id, (x) => x.kind === 'file' && ['completed', 'error'].includes(x.status));
   await manager.shutdown();
-  assert.equal(d.status, 'completed', d.error);
-  assert.equal(fs.readFileSync(d.filePath, 'utf8'), list);
+  assert.equal(d.status, 'completed', d.error ?? undefined);
+  assert.equal(fs.readFileSync(output(d), 'utf8'), list);
 });
 
 test('manager: cancelling a stream removes its temporary files', async () => {
@@ -417,8 +431,10 @@ test('manager: cancelling a stream removes its temporary files', async () => {
   const dir = newDir();
   const manager = new DownloadManager({ storeDir: newDir(), defaultDownloadDir: dir });
   const id = manager.add({ url: `${server.base}/p/index.m3u8` });
-  await waitFor(manager, id, (d) => d.chunks?.done > 2);
-  const temp = manager.downloads.get(id).tempDir;
+  await waitFor(manager, id, (d) => (d.chunks?.done ?? 0) > 2);
+  const download = manager.downloads.get(id);
+  assert.ok(download instanceof StreamDownload);
+  const temp = download.tempDir;
   assert.ok(fs.existsSync(temp));
   await manager.remove(id);
   await manager.shutdown();
@@ -432,7 +448,7 @@ test('manager: a stream interrupted by shutdown continues on the next launch', a
   const storeDir = newDir();
   const first = new DownloadManager({ storeDir, defaultDownloadDir: newDir() });
   const id = first.add({ url: `${server.base}/q/index.m3u8`, quality: '720' });
-  await waitFor(first, id, (d) => d.chunks?.done > 3);
+  await waitFor(first, id, (d) => (d.chunks?.done ?? 0) > 3);
   await first.shutdown();
 
   const saved = JSON.parse(fs.readFileSync(path.join(storeDir, 'downloads.json'), 'utf8'));
@@ -445,14 +461,14 @@ test('manager: a stream interrupted by shutdown continues on the next launch', a
   second.startQueued();
   const d = await done;
   await second.shutdown();
-  assert.equal(d.status, 'completed', d.error);
-  assert.equal(sha(fs.readFileSync(d.filePath)), sha(Buffer.concat(segs)));
+  assert.equal(d.status, 'completed', d.error ?? undefined);
+  assert.equal(sha(fs.readFileSync(output(d))), sha(Buffer.concat(segs)));
 });
 
 // ---------------------------------------------------------------- ffmpeg
 
 /** Runs ffmpeg inside dir with relative output names: some builds write segments to the cwd. */
-function ffmpeg(dir, args) {
+function ffmpeg(dir: string, args: string[]): void {
   const result = spawnSync(FFMPEG, ['-hide_banner', '-loglevel', 'error', '-y', ...args], { encoding: 'utf8', cwd: dir });
   assert.equal(result.status, 0, result.stderr);
 }
@@ -461,7 +477,7 @@ const VIDEO_IN = ['-f', 'lavfi', '-i', 'testsrc=duration=4:size=320x240:rate=25'
 const AUDIO_IN = ['-f', 'lavfi', '-i', 'sine=frequency=440:duration=4'];
 const H264 = ['-c:v', 'libx264', '-preset', 'ultrafast', '-g', '25', '-pix_fmt', 'yuv420p'];
 
-async function streamTypes(file) {
+async function streamTypes(file: string): Promise<(string | undefined)[]> {
   return (await probeStreams({ ffprobe: FFPROBE, file })).map((s) => s.codec_type).sort();
 }
 
@@ -481,16 +497,16 @@ test('ffmpeg: HLS with a separate audio rendition becomes one MP4', { skip: noFf
 
   const d = makeStream(`${server.base}/ff1/master.m3u8`, { withTools: tools });
   await d.start();
-  assert.equal(d.state.status, 'completed', d.state.error);
-  assert.equal(path.extname(d.state.filePath), '.mp4');
-  assert.deepEqual(await streamTypes(d.state.filePath), ['audio', 'video']);
-  assert.match(d.state.selection.audio, /Principal/);
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
+  assert.equal(path.extname(output(d)), '.mp4');
+  assert.deepEqual(await streamTypes(output(d)), ['audio', 'video']);
+  assert.match(d.state.selection?.audio ?? '', /Principal/);
 
   const audio = makeStream(`${server.base}/ff1/master.m3u8`, { withTools: tools, quality: 'audio' });
   await audio.start();
-  assert.equal(audio.state.status, 'completed', audio.state.error);
-  assert.equal(path.extname(audio.state.filePath), '.m4a');
-  assert.deepEqual(await streamTypes(audio.state.filePath), ['audio']);
+  assert.equal(audio.state.status, 'completed', audio.state.error ?? undefined);
+  assert.equal(path.extname(output(audio)), '.m4a');
+  assert.deepEqual(await streamTypes(output(audio)), ['audio']);
 });
 
 test('ffmpeg: fMP4 HLS with muxed audio and video', { skip: noFfmpeg }, async () => {
@@ -501,8 +517,8 @@ test('ffmpeg: fMP4 HLS with muxed audio and video', { skip: noFfmpeg }, async ()
   server.serveDir('/ff2/', dir);
   const d = makeStream(`${server.base}/ff2/index.m3u8`, { withTools: tools });
   await d.start();
-  assert.equal(d.state.status, 'completed', d.state.error);
-  assert.deepEqual(await streamTypes(d.state.filePath), ['audio', 'video']);
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
+  assert.deepEqual(await streamTypes(output(d)), ['audio', 'video']);
 });
 
 test('ffmpeg: DASH manifest with separate audio and video', { skip: noFfmpeg }, async () => {
@@ -512,9 +528,9 @@ test('ffmpeg: DASH manifest with separate audio and video', { skip: noFfmpeg }, 
   server.serveDir('/ff3/', dir);
   const d = makeStream(`${server.base}/ff3/manifest.mpd`, { withTools: tools, quality: '1080' });
   await d.start();
-  assert.equal(d.state.status, 'completed', d.state.error);
+  assert.equal(d.state.status, 'completed', d.state.error ?? undefined);
   assert.equal(d.state.protocol, 'dash');
-  assert.deepEqual(await streamTypes(d.state.filePath), ['audio', 'video']);
+  assert.deepEqual(await streamTypes(output(d)), ['audio', 'video']);
   assert.ok(d.state.notices.some((n) => /1080p não está disponível; usado 240p/.test(n)));
 });
 
@@ -533,7 +549,7 @@ test('ffmpeg: a failed remux is reported and nothing is marked as completed', { 
   const d = makeStream(`${server.base}/ff4/master.m3u8`, { withTools: tools, dir });
   await d.start();
   assert.equal(d.state.status, 'error');
-  assert.match(d.state.error, /FFmpeg falhou/);
+  assert.match(d.state.error ?? '', /FFmpeg falhou/);
   assert.equal(d.state.filePath, undefined);
   // Only the temporary folder remains, so a retry does not download again.
   assert.deepEqual(fs.readdirSync(dir), [path.basename(d.tempDir)]);

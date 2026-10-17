@@ -1,10 +1,38 @@
-'use strict';
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import type { AddressInfo } from 'node:net';
 
-const http = require('node:http');
-const fs = require('node:fs');
-const path = require('node:path');
+export interface RouteOptions {
+  type?: string;
+  failTimes?: number;
+  failStatus?: number;
+  status?: number;
+  delayMs?: number;
+}
 
-const TYPES = {
+interface Route extends RouteOptions {
+  body: Buffer | string | null;
+}
+
+export interface LoggedRequest {
+  path: string;
+  host: string | undefined;
+  cookie: string | null;
+  range: string | null;
+}
+
+export interface StreamServer {
+  base: string;
+  port: number;
+  log: LoggedRequest[];
+  set(pathname: string, body: Buffer | string | null, options?: RouteOptions): void;
+  serveDir(prefix: string, dir: string): void;
+  requests(prefix: string): LoggedRequest[];
+  close(): Promise<void>;
+}
+
+const TYPES: Record<string, string> = {
   '.m3u8': 'application/vnd.apple.mpegurl',
   '.mpd': 'application/dash+xml',
   '.ts': 'video/mp2t',
@@ -19,13 +47,13 @@ const TYPES = {
  *   serveDir(prefix, dir)   serves files written by ffmpeg
  * Every request is logged with its host, cookie and range.
  */
-async function startStreamServer() {
-  const routes = new Map();
-  const dirs = [];
-  const log = [];
+export async function startStreamServer(): Promise<StreamServer> {
+  const routes = new Map<string, Route>();
+  const dirs: [string, string][] = [];
+  const log: LoggedRequest[] = [];
 
   const server = http.createServer(async (req, res) => {
-    const { pathname } = new URL(req.url, 'http://x');
+    const { pathname } = new URL(req.url ?? '/', 'http://x');
     log.push({ path: pathname, host: req.headers.host, cookie: req.headers.cookie ?? null, range: req.headers.range ?? null });
     let route = routes.get(pathname);
     if (!route) {
@@ -42,8 +70,8 @@ async function startStreamServer() {
       res.end();
       return;
     }
-    if (route.failTimes > 0) {
-      route.failTimes--;
+    if ((route.failTimes ?? 0) > 0) {
+      route.failTimes = (route.failTimes ?? 0) - 1;
       res.writeHead(route.failStatus ?? 503);
       res.end();
       return;
@@ -55,7 +83,7 @@ async function startStreamServer() {
     }
     if (route.delayMs) await new Promise((r) => setTimeout(r, route.delayMs));
     const body = Buffer.isBuffer(route.body) ? route.body : Buffer.from(String(route.body));
-    const headers = { 'Content-Type': route.type ?? 'application/octet-stream', 'Accept-Ranges': 'bytes' };
+    const headers: http.OutgoingHttpHeaders = { 'Content-Type': route.type ?? 'application/octet-stream', 'Accept-Ranges': 'bytes' };
     const match = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
     if (match) {
       const start = Number(match[1]);
@@ -71,8 +99,8 @@ async function startStreamServer() {
     res.end(body);
   });
 
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address();
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const { port } = server.address() as AddressInfo;
   return {
     base: `http://127.0.0.1:${port}`,
     port,
@@ -86,11 +114,10 @@ async function startStreamServer() {
     requests(prefix) {
       return log.filter((r) => r.path.startsWith(prefix));
     },
-    close: () => new Promise((resolve) => {
+    close: () => new Promise<void>((resolve) => {
       server.closeAllConnections();
-      server.close(resolve);
+      server.close(() => resolve());
     }),
   };
 }
 
-module.exports = { startStreamServer };

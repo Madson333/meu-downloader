@@ -1,7 +1,14 @@
-'use strict';
+import http from 'node:http';
+import crypto from 'node:crypto';
+import type { AddressInfo } from 'node:net';
 
-const http = require('node:http');
-const crypto = require('node:crypto');
+export interface FileServer {
+  base: string;
+  body: Buffer;
+  sha: string;
+  stats: { requests: number; ranges: [number, number][]; maxConcurrent: number };
+  close(): Promise<void>;
+}
 
 /**
  * Local HTTP server for engine tests.
@@ -13,18 +20,23 @@ const crypto = require('node:crypto');
  *   /slow        ranged file sent at ~bytesPerSecond per connection
  *   /flaky       ranged file whose connections drop after 300 KiB once each
  */
-async function startFileServer({ size = 6 * 1024 * 1024, bytesPerSecond = 2 * 1024 * 1024 } = {}) {
+export async function startFileServer({ size = 6 * 1024 * 1024, bytesPerSecond = 2 * 1024 * 1024 } = {}): Promise<FileServer> {
   const body = crypto.randomBytes(size);
-  const stats = { requests: 0, ranges: [], maxConcurrent: 0 };
-  const flakyDropped = new Set();
+  const stats: FileServer['stats'] = { requests: 0, ranges: [], maxConcurrent: 0 };
+  const flakyDropped = new Set<string>();
   let open = 0;
 
-  const sendRange = (req, res, extraHeaders = {}, { throttle = false, dropAfter = null } = {}) => {
+  const sendRange = (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    extraHeaders: http.OutgoingHttpHeaders = {},
+    { throttle = false, dropAfter = null }: { throttle?: boolean; dropAfter?: number | null } = {},
+  ): void => {
     const match = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
     let start = 0;
     let end = size - 1;
     let status = 200;
-    const headers = { 'Accept-Ranges': 'bytes', ETag: '"v1"', ...extraHeaders };
+    const headers: http.OutgoingHttpHeaders = { 'Accept-Ranges': 'bytes', ETag: '"v1"', ...extraHeaders };
     if (match) {
       start = Number(match[1]);
       end = match[2] ? Math.min(Number(match[2]), size - 1) : size - 1;
@@ -74,7 +86,7 @@ async function startFileServer({ size = 6 * 1024 * 1024, bytesPerSecond = 2 * 10
     open++;
     stats.maxConcurrent = Math.max(stats.maxConcurrent, open);
     res.on('close', () => open--);
-    const { pathname } = new URL(req.url, 'http://x');
+    const { pathname } = new URL(req.url ?? '/', 'http://x');
     switch (pathname) {
       case '/file':
         return sendRange(req, res);
@@ -114,19 +126,18 @@ async function startFileServer({ size = 6 * 1024 * 1024, bytesPerSecond = 2 * 10
         return res.end();
     }
   });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const base = `http://127.0.0.1:${server.address().port}`;
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const sha = crypto.createHash('sha256').update(body).digest('hex');
   return {
     base,
     body,
     sha,
     stats,
-    close: () => new Promise((resolve) => {
+    close: () => new Promise<void>((resolve) => {
       server.closeAllConnections();
-      server.close(resolve);
+      server.close(() => resolve());
     }),
   };
 }
 
-module.exports = { startFileServer };

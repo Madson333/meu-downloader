@@ -1,8 +1,7 @@
-'use strict';
+import { contextBridge, ipcRenderer } from 'electron';
+import type { DownloaderApi, DownloadView } from '../shared/api';
 
-const { contextBridge, ipcRenderer } = require('electron');
-
-contextBridge.exposeInMainWorld('downloader', {
+const api: DownloaderApi = {
   list: () => ipcRenderer.invoke('downloads:list'),
   add: (options) => ipcRenderer.invoke('downloads:add', options),
   pause: (ids) => ipcRenderer.invoke('downloads:pause', ids),
@@ -20,9 +19,15 @@ contextBridge.exposeInMainWorld('downloader', {
   clipboardUrl: () => ipcRenderer.invoke('clipboard:url'),
   updateVideoTool: () => ipcRenderer.invoke('video:update'),
   onUpdate: (callback) => {
-    const listener = (_event, list) => callback(list);
+    const listener = (_event: Electron.IpcRendererEvent, list: DownloadView[]): void => callback(list);
     ipcRenderer.on('downloads:update', listener);
-    return () => ipcRenderer.removeListener('downloads:update', listener);
+    return () => {
+      ipcRenderer.removeListener('downloads:update', listener);
+    };
   },
-  onFocusDownload: (callback) => ipcRenderer.on('downloads:focus', (_event, id) => callback(id)),
-});
+  onFocusDownload: (callback) => {
+    ipcRenderer.on('downloads:focus', (_event, id: string) => callback(id));
+  },
+};
+
+contextBridge.exposeInMainWorld('downloader', api);

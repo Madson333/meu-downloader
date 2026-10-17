@@ -1,23 +1,53 @@
-'use strict';
-
-const fs = require('node:fs');
-const path = require('node:path');
-const { EventEmitter } = require('node:events');
-const { request, parseContentRange, HttpError } = require('./http-client');
-const { chooseFileName, uniquePath } = require('./file-name');
-const { isManifestMime } = require('./manifest');
+import fs from 'node:fs';
+import path from 'node:path';
+import { EventEmitter } from 'node:events';
+import type { IncomingMessage, OutgoingHttpHeaders } from 'node:http';
+import { request, parseContentRange, HttpError } from './http-client';
+import { chooseFileName, uniquePath } from './file-name';
+import { isManifestMime } from './manifest';
+import type { SpeedLimiter } from './speed-limiter';
+import { asCodedError, type BaseState, type Download, type InitialState } from './types';
 
 const MAX_ATTEMPTS = 6;
-const TEMP_SUFFIX = '.mdpart';
+export const TEMP_SUFFIX = '.mdpart';
+
+/** [start, end] inclusive; `pos` is the first byte not yet written; `end === null` means unknown size. */
+export interface Segment {
+  start: number;
+  end: number | null;
+  pos: number;
+  /** In memory only: a connection is working on it. */
+  active?: boolean;
+  /** In memory only: bytes up to here are claimed by an in-flight write. */
+  reserved?: number;
+}
+
+export interface FileState extends BaseState {
+  kind: 'file';
+  segments: Segment[];
+  resumable: boolean;
+  validator: { etag: string | null; lastModified: string | null } | null;
+  finalUrl?: string;
+  mime?: string | null;
+  /** Set when a .m3u8 turned out not to be a stream: never divert it to the stream engine again. */
+  forceFile?: boolean;
+}
+
+export interface SegmentedOptions {
+  limiter: SpeedLimiter;
+  getMaxConnections: () => number;
+  minSplitBytes?: number;
+  isPathTaken?: (candidate: string) => boolean;
+}
 
 class RestartRequired extends Error {
-  constructor(reason) {
+  constructor(reason: string) {
     super(reason);
     this.name = 'RestartRequired';
   }
 }
 
-const sleep = (ms, signal) => new Promise((resolve, reject) => {
+const sleep = (ms: number, signal: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
   const timer = setTimeout(resolve, ms);
   signal.addEventListener('abort', () => {
     clearTimeout(timer);
@@ -35,8 +65,20 @@ const sleep = (ms, signal) => new Promise((resolve, reject) => {
  * `end` on its next chunk and stops there, so the file is re-divided while it
  * downloads. `end === null` means the size is unknown (single connection).
  */
-class SegmentedDownload extends EventEmitter {
-  constructor(state, { limiter, getMaxConnections, minSplitBytes = 512 * 1024, isPathTaken = () => false }) {
+export class SegmentedDownload extends EventEmitter implements Download {
+  readonly state: FileState;
+  private readonly limiter: SpeedLimiter;
+  private readonly getMaxConnections: () => number;
+  private readonly minSplitBytes: number;
+  private readonly isPathTaken: (candidate: string) => boolean;
+  private controller = new AbortController();
+  private file: fs.promises.FileHandle | null = null;
+  private running: Promise<void> | null = null;
+  private pauseRequested = false;
+
+  constructor(state: InitialState<FileState>, {
+    limiter, getMaxConnections, minSplitBytes = 512 * 1024, isPathTaken = () => false,
+  }: SegmentedOptions) {
     super();
     this.state = {
       status: 'queued',
@@ -46,38 +88,36 @@ class SegmentedDownload extends EventEmitter {
       validator: null,
       error: null,
       ...state,
+      kind: 'file',
     };
     this.limiter = limiter;
     this.getMaxConnections = getMaxConnections;
     this.minSplitBytes = minSplitBytes;
     this.isPathTaken = isPathTaken;
-    this.controller = null;
-    this.file = null;
-    this.running = null;
   }
 
-  get tempPath() {
+  get tempPath(): string {
     return this.state.filePath + TEMP_SUFFIX;
   }
 
-  get downloaded() {
+  get downloaded(): number {
     return this.state.segments.reduce((sum, s) => sum + (s.pos - s.start), 0);
   }
 
-  get activeConnections() {
+  get activeConnections(): number {
     return this.state.segments.filter((s) => s.active).length;
   }
 
-  #setStatus(status, error = null, errorCode = null) {
+  #setStatus(status: FileState['status'], error: string | null = null, errorCode: string | null = null): void {
     this.state.status = status;
     this.state.error = error;
     this.state.errorCode = errorCode;
     this.emit('change', this);
   }
 
-  #headers(extra = {}) {
+  #headers(extra: OutgoingHttpHeaders = {}): OutgoingHttpHeaders {
     const h = this.state.headers ?? {};
-    const headers = {
+    const headers: OutgoingHttpHeaders = {
       'User-Agent': h.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
       Accept: '*/*',
       // Compressed bodies cannot be split by byte ranges.
@@ -90,7 +130,7 @@ class SegmentedDownload extends EventEmitter {
   }
 
   /** Starts or resumes the download. Resolves when it completes, pauses or fails. */
-  start() {
+  start(): Promise<void> {
     if (this.running) return this.running;
     this.controller = new AbortController();
     this.#setStatus('downloading');
@@ -100,7 +140,7 @@ class SegmentedDownload extends EventEmitter {
     return this.running;
   }
 
-  async pause() {
+  async pause(): Promise<void> {
     if (!this.running) {
       if (this.state.status !== 'completed') this.#setStatus('paused');
       return;
@@ -110,11 +150,11 @@ class SegmentedDownload extends EventEmitter {
     await this.running;
   }
 
-  async discardTemp() {
+  async discardTemp(): Promise<void> {
     if (this.state.filePath) await fs.promises.rm(this.tempPath, { force: true });
   }
 
-  async #run() {
+  async #run(): Promise<void> {
     this.pauseRequested = false;
     try {
       for (let restarts = 0; ; restarts++) {
@@ -132,7 +172,8 @@ class SegmentedDownload extends EventEmitter {
         }
       }
       await this.#finish();
-    } catch (err) {
+    } catch (caught) {
+      const err = asCodedError(caught);
       for (const s of this.state.segments) s.active = false;
       await this.#closeFile();
       if (this.pauseRequested) this.#setStatus('paused');
@@ -140,34 +181,34 @@ class SegmentedDownload extends EventEmitter {
     }
   }
 
-  #canResume() {
+  #canResume(): boolean {
     return this.state.resumable
       && this.state.segments.length > 0
-      && this.state.filePath
+      && !!this.state.filePath
       && fs.existsSync(this.tempPath);
   }
 
-  async #fresh() {
+  async #fresh(): Promise<void> {
     const signal = this.controller.signal;
     const { res, finalUrl } = await request(this.state.url, {
       headers: this.#headers({ Range: 'bytes=0-' }),
       signal,
     });
 
-    // A web page in response to a link that does not name an HTML file means the
-    // link opens a page (e.g. a video site), not a downloadable file.
     const mime = String(res.headers['content-type'] ?? '').toLowerCase();
     // An HLS/DASH manifest served without a .m3u8/.mpd name: the manager hands it to the stream engine.
     if (!this.state.forceFile && isManifestMime(mime)) {
       res.destroy();
       throw new HttpError('O link é um manifesto de stream (HLS/DASH)', { code: 'STREAM_MANIFEST' });
     }
+    // A web page in response to a link that does not name an HTML file means the
+    // link opens a page (e.g. a video site), not a downloadable file.
     if (mime.startsWith('text/html') && !/\.x?html?$/i.test(new URL(finalUrl).pathname)) {
       res.destroy();
       throw new HttpError('O link abre uma página web, não um arquivo. Copie o link direto do arquivo.', { code: 'HTML_PAGE' });
     }
 
-    let total = null;
+    let total: number | null = null;
     if (res.statusCode === 206) {
       const range = parseContentRange(res.headers['content-range']);
       if (!range || range.start !== 0) {
@@ -209,7 +250,7 @@ class SegmentedDownload extends EventEmitter {
     await this.#runSegments(res);
   }
 
-  async #resume() {
+  async #resume(): Promise<void> {
     const stat = await fs.promises.stat(this.tempPath);
     if (stat.size !== this.state.totalSize) throw new RestartRequired('arquivo temporário inconsistente');
     this.file = await fs.promises.open(this.tempPath, 'r+');
@@ -217,12 +258,12 @@ class SegmentedDownload extends EventEmitter {
   }
 
   /** Runs connections until every segment is complete. */
-  #runSegments(initialResponse) {
+  #runSegments(initialResponse: IncomingMessage | null): Promise<void> {
     const segments = this.state.segments;
     return new Promise((resolve, reject) => {
       let failed = false;
 
-      const launch = (segment, res) => {
+      const launch = (segment: Segment, res: IncomingMessage | null): void => {
         segment.active = true;
         segment.reserved = segment.pos;
         this.#downloadSegment(segment, res).then(() => {
@@ -233,7 +274,7 @@ class SegmentedDownload extends EventEmitter {
             if (segments.every((s) => s.end !== null && s.pos > s.end)) resolve();
             else reject(new HttpError('Download interrompido antes do fim'));
           }
-        }, (err) => {
+        }, (err: unknown) => {
           segment.active = false;
           if (failed) return;
           failed = true;
@@ -242,7 +283,7 @@ class SegmentedDownload extends EventEmitter {
         });
       };
 
-      const fill = () => {
+      const fill = (): void => {
         while (this.activeConnections < Math.max(1, this.getMaxConnections())) {
           const idle = segments.find((s) => !s.active && (s.end === null || s.pos <= s.end));
           if (idle) {
@@ -255,35 +296,36 @@ class SegmentedDownload extends EventEmitter {
         }
       };
 
-      if (initialResponse) launch(segments[0], initialResponse);
+      const [first] = segments;
+      if (initialResponse && first) launch(first, initialResponse);
       fill();
       if (segments.every((s) => !s.active)) resolve();
     });
   }
 
   /** Splits the largest active segment in half and returns the new tail segment. */
-  #split() {
+  #split(): Segment | null {
     if (!this.state.resumable) return null;
-    let best = null;
+    let best: Segment | null = null;
     let bestRemaining = 0;
     for (const s of this.state.segments) {
       if (!s.active || s.end === null) continue;
-      const remaining = s.end - s.reserved + 1;
+      const remaining = s.end - (s.reserved ?? s.pos) + 1;
       if (remaining > bestRemaining) {
         best = s;
         bestRemaining = remaining;
       }
     }
-    if (!best || bestRemaining < 2 * this.minSplitBytes) return null;
-    const newStart = best.reserved + Math.floor(bestRemaining / 2);
-    const tail = { start: newStart, end: best.end, pos: newStart };
+    if (!best || best.end === null || bestRemaining < 2 * this.minSplitBytes) return null;
+    const newStart = (best.reserved ?? best.pos) + Math.floor(bestRemaining / 2);
+    const tail: Segment = { start: newStart, end: best.end, pos: newStart };
     best.end = newStart - 1;
     const segments = this.state.segments;
     segments.splice(segments.indexOf(best) + 1, 0, tail);
     return tail;
   }
 
-  async #downloadSegment(segment, initialResponse) {
+  async #downloadSegment(segment: Segment, initialResponse: IncomingMessage | null): Promise<void> {
     const signal = this.controller.signal;
     let res = initialResponse;
     for (let attempt = 1; ; attempt++) {
@@ -301,7 +343,8 @@ class SegmentedDownload extends EventEmitter {
         }
         if (segment.pos > segment.end) return;
         throw new HttpError('Conexão encerrada antes do fim do segmento', { retryable: true });
-      } catch (err) {
+      } catch (caught) {
+        const err = asCodedError(caught);
         res?.destroy();
         res = null;
         if (signal.aborted) throw signal.reason ?? err;
@@ -315,8 +358,8 @@ class SegmentedDownload extends EventEmitter {
     }
   }
 
-  async #openRange(segment) {
-    const extra = { Range: `bytes=${segment.pos}-${segment.end}` };
+  async #openRange(segment: Segment): Promise<IncomingMessage> {
+    const extra: OutgoingHttpHeaders = { Range: `bytes=${segment.pos}-${segment.end}` };
     const validator = this.state.validator;
     const ifRange = validator?.etag || validator?.lastModified;
     if (ifRange) extra['If-Range'] = ifRange;
@@ -338,18 +381,21 @@ class SegmentedDownload extends EventEmitter {
     return res;
   }
 
-  async #pump(segment, res) {
+  async #pump(segment: Segment, res: IncomingMessage): Promise<void> {
     const signal = this.controller.signal;
+    const file = this.file;
+    if (!file) throw new Error('Arquivo temporário não está aberto');
     try {
-      for await (const chunk of res) {
+      for await (const chunk of res as AsyncIterable<Buffer>) {
         // `end` can shrink at any time when another connection splits this segment.
-        const remaining = segment.end === null ? chunk.length : segment.end - segment.reserved + 1;
+        const reserved = segment.reserved ?? segment.pos;
+        const remaining = segment.end === null ? chunk.length : segment.end - reserved + 1;
         if (remaining <= 0) break;
         const piece = remaining < chunk.length ? chunk.subarray(0, remaining) : chunk;
-        const at = segment.reserved;
-        segment.reserved += piece.length;
+        const at = reserved;
+        segment.reserved = reserved + piece.length;
         await this.limiter.take(piece.length, signal);
-        await this.file.write(piece, 0, piece.length, at);
+        await file.write(piece, 0, piece.length, at);
         segment.pos = at + piece.length;
         if (segment.end !== null && segment.pos > segment.end) break;
       }
@@ -358,17 +404,18 @@ class SegmentedDownload extends EventEmitter {
     }
   }
 
-  async #closeFile() {
+  async #closeFile(): Promise<void> {
     const file = this.file;
     this.file = null;
     await file?.close().catch(() => {});
   }
 
-  async #finish() {
+  async #finish(): Promise<void> {
     await this.#closeFile();
-    let target = this.state.filePath;
+    const fileName = this.state.fileName ?? 'download';
+    let target = this.state.filePath ?? path.join(this.state.dir, fileName);
     if (fs.existsSync(target)) {
-      target = uniquePath(this.state.dir, this.state.fileName, this.isPathTaken);
+      target = uniquePath(this.state.dir, fileName, this.isPathTaken);
     }
     await fs.promises.rename(this.tempPath, target);
     this.state.filePath = target;
@@ -378,7 +425,7 @@ class SegmentedDownload extends EventEmitter {
     this.#setStatus('completed');
   }
 
-  toJSON() {
+  toJSON(): FileState {
     const { segments, ...rest } = this.state;
     return {
       ...rest,
@@ -387,5 +434,3 @@ class SegmentedDownload extends EventEmitter {
     };
   }
 }
-
-module.exports = { SegmentedDownload, TEMP_SUFFIX };

@@ -149,18 +149,37 @@ npm install
 npm start
 ```
 
+O código é TypeScript (modo `strict`). `npm start` compila e abre o app; para só
+compilar, use `npm run build`, e para só checar os tipos, `npm run typecheck`.
+
+| Pasta | Conteúdo | Configuração |
+|---|---|---|
+| `src/engine`, `src/main`, `test`, `scripts` | motor de download, processo principal, testes | `tsconfig.json` (Node, CommonJS) |
+| `src/renderer` | interface | `src/renderer/tsconfig.json` (navegador, módulo ES) |
+| `extension/src` | extensão do navegador | `extension/tsconfig.json` (`@types/chrome`) |
+| `src/shared/api.d.ts` | tipos trocados entre o processo principal e a interface | — |
+
+A compilação vai para `dist/` (o `main` do `package.json` aponta para
+`dist/src/main/main.js`). A extensão é compilada dentro da própria pasta `extension/`
+(`background.js` e `popup.js`). Esses arquivos gerados ficam fora do git.
+
 Ao fechar a janela, o app continua na bandeja do sistema (ao lado do relógio)
 e os downloads seguem em andamento. Para encerrar, use **Sair** no menu da bandeja.
 Downloads em andamento continuam automaticamente na próxima vez que o app abrir.
 
-Para abrir sem console, dê dois cliques em `Meu Downloader.vbs`. Você pode criar um
-atalho dele na área de trabalho ou em `shell:startup`, para iniciar com o Windows.
+Para abrir sem console, dê dois cliques em `Meu Downloader.vbs`. Ele compila o código
+antes de abrir, então sempre roda a versão atual. Você pode criar um atalho dele na
+área de trabalho ou em `shell:startup`, para iniciar com o Windows.
 
 ## Extensão do navegador (Chrome ou Edge)
 
-1. Abra `chrome://extensions` (ou `edge://extensions`).
-2. Ative o **Modo do desenvolvedor**.
-3. Clique em **Carregar sem compactação** e escolha a pasta `extension`.
+1. Rode `npm run build` (gera `extension/background.js` e `extension/popup.js`).
+2. Abra `chrome://extensions` (ou `edge://extensions`).
+3. Ative o **Modo do desenvolvedor**.
+4. Clique em **Carregar sem compactação** e escolha a pasta `extension`.
+
+Depois de mudar o código da extensão, rode `npm run build` de novo e clique em
+**Recarregar** na página de extensões.
 
 Com o app aberto, downloads dos tipos configurados (zip, exe, mp4, iso, pdf…) são
 cancelados no navegador e enviados ao app. Com o app fechado, o navegador baixa
@@ -199,6 +218,8 @@ Para um perfil separado (por exemplo, uma cópia portátil), defina a variável
 npm test
 ```
 
+O comando compila o projeto e roda os testes já compilados (`dist/test/*.test.js`).
+
 Os testes sobem servidores HTTP locais e não acessam a internet nem serviços de
 streaming. Eles cobrem:
 
@@ -206,11 +227,11 @@ streaming. Eles cobrem:
   servidor sem `Range`, tamanho desconhecido, redirecionamento com `Content-Disposition`,
   conexões que caem, erros HTTP, recusa de páginas web, limite de velocidade, fila do
   gerenciador e a segurança da ponte com a extensão.
-- **Manifestos (`test/manifest.test.js`):** HLS principal e de mídia, URLs relativas,
+- **Manifestos (`test/manifest.test.ts`):** HLS principal e de mídia, URLs relativas,
   intervalos de bytes, AES-128, DASH com template, timeline, lista e `BaseURL`, áudio
   e legendas, seleção de qualidade, recusa de DRM, ao vivo e estruturas não suportadas,
   parser XML e detecção de endereços internos.
-- **Streams (`test/stream.test.js`):** ordem dos segmentos, escolha de variante,
+- **Streams (`test/stream.test.ts`):** ordem dos segmentos, escolha de variante,
   intervalos de bytes, fMP4, descriptografia AES-128, novas tentativas após HTTP 503,
   erro 404 e retomada, pausa e retomada do estado salvo, manifesto alterado durante a
   pausa, recusa de DRM (inclusive no MP4) e de ao vivo, cookies restritos ao host,

@@ -1,15 +1,35 @@
-'use strict';
-
-const { test } = require('node:test');
-const assert = require('node:assert/strict');
-const {
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import {
   parseHls, parseDash, parseManifest, parseXml, parseAttributes, parseIsoDuration, expandTemplate,
   selectVideo, selectDashAudio, pickDefault, isManifestUrl, isManifestMime, isProtectedMp4,
-} = require('../src/engine/manifest');
-const { isPrivateAddress } = require('../src/engine/http-client');
-const { streamBaseName } = require('../src/engine/stream-download');
+  type HlsMaster, type HlsMedia,
+} from '../src/engine/manifest';
+import { isPrivateAddress } from '../src/engine/http-client';
+import { streamBaseName } from '../src/engine/stream-download';
 
 const BASE = 'https://cdn.example.com/show/ep1/master.m3u8';
+
+/** assert.throws validator: the thrown error carries this code. */
+const hasCode = (code: string) => (err: unknown): boolean => (err as { code?: unknown }).code === code;
+
+/** The value, failing the test when it is missing. */
+function must<T>(value: T | null | undefined): T {
+  assert.ok(value !== null && value !== undefined, 'expected a value');
+  return value;
+}
+
+function master(text: string, base = BASE): HlsMaster {
+  const m = parseHls(text, base);
+  assert.ok(m.kind === 'master');
+  return m;
+}
+
+function media(text: string, base = BASE): HlsMedia {
+  const m = parseHls(text, base);
+  assert.ok(m.kind === 'media');
+  return m;
+}
 
 const MASTER = `#EXTM3U
 #EXT-X-VERSION:6
@@ -28,7 +48,7 @@ audio-only.m3u8
 `;
 
 test('HLS master playlist: variants, renditions and URL resolution', () => {
-  const m = parseHls(MASTER, BASE);
+  const m = master(MASTER);
   assert.equal(m.kind, 'master');
   assert.equal(m.variants.length, 4);
   const [v360, v720, v1080, audioOnly] = m.variants;
@@ -45,7 +65,7 @@ test('HLS master playlist: variants, renditions and URL resolution', () => {
   const audio = m.renditions.filter((r) => r.type === 'audio');
   assert.equal(audio.length, 2);
   assert.equal(audio[1].uri, 'https://cdn.example.com/show/ep1/audio/pt.m3u8');
-  assert.equal(pickDefault(audio).language, 'pt');
+  assert.equal(must(pickDefault(audio)).language, 'pt');
   const subs = m.renditions.filter((r) => r.type === 'subtitles');
   assert.equal(subs.length, 1);
   assert.equal(subs[0].groupId, 'subs');
@@ -70,7 +90,7 @@ media.mp4
 ../other/seg3.m4s
 #EXT-X-ENDLIST
 `;
-  const m = parseHls(text, 'https://cdn.example.com/a/b/index.m3u8');
+  const m = media(text, 'https://cdn.example.com/a/b/index.m3u8');
   assert.equal(m.kind, 'media');
   assert.equal(m.live, false);
   assert.equal(m.mediaSequence, 10);
@@ -86,19 +106,19 @@ media.mp4
 });
 
 test('HLS live playlists are flagged and plain M3U lists are not streams', () => {
-  const live = parseHls('#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\na.ts\n', BASE);
+  const live = media('#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\na.ts\n', BASE);
   assert.equal(live.live, true);
-  const event = parseHls('#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4,\na.ts\n', BASE);
+  const event = media('#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4,\na.ts\n', BASE);
   assert.equal(event.live, false);
   assert.throws(
     () => parseHls('#EXTM3U\n#EXTINF:-1,Canal 1\nhttp://iptv.example/1\n', BASE),
-    (err) => err.code === 'NOT_A_STREAM',
+    hasCode('NOT_A_STREAM'),
   );
-  assert.throws(() => parseManifest('<html></html>', BASE), (err) => err.code === 'NOT_A_STREAM');
+  assert.throws(() => parseManifest('<html></html>', BASE), hasCode('NOT_A_STREAM'));
 });
 
 test('HLS AES-128 keys use the explicit IV or the media sequence number', () => {
-  const m = parseHls(`#EXTM3U
+  const m = media(`#EXTM3U
 #EXT-X-TARGETDURATION:4
 #EXT-X-MEDIA-SEQUENCE:5
 #EXT-X-KEY:METHOD=AES-128,URI="key.bin"
@@ -113,7 +133,7 @@ c.ts
 #EXT-X-ENDLIST
 `, BASE);
   assert.deepEqual(m.segments[0].key, { uri: 'https://cdn.example.com/show/ep1/key.bin', iv: '00000000000000000000000000000005' });
-  assert.equal(m.segments[1].key.iv, '000102030405060708090a0b0c0d0e0f');
+  assert.equal(m.segments[1]?.key?.iv, '000102030405060708090a0b0c0d0e0f');
   assert.equal(m.segments[2].key, null);
 });
 
@@ -126,26 +146,26 @@ test('DRM-protected HLS is rejected', () => {
   for (const key of variants) {
     assert.throws(
       () => parseHls(`#EXTM3U\n#EXT-X-TARGETDURATION:4\n${key}\n#EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n`, BASE),
-      (err) => err.code === 'DRM',
+      hasCode('DRM'),
       key,
     );
   }
   assert.throws(
     () => parseHls(`#EXTM3U\n#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI="skd://x",KEYFORMAT="com.apple.streamingkeydelivery"\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n`, BASE),
-    (err) => err.code === 'DRM',
+    hasCode('DRM'),
   );
 });
 
 test('HLS rejects unsafe URLs and unsupported structures', () => {
   assert.throws(
     () => parseHls('#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nfile:///C:/Windows/win.ini\n#EXT-X-ENDLIST\n', BASE),
-    (err) => err.code === 'UNSUPPORTED',
+    hasCode('UNSUPPORTED'),
   );
   assert.throws(
     () => parseHls('#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI="a.mp4"\n#EXTINF:4,\n1.m4s\n#EXT-X-MAP:URI="b.mp4"\n#EXTINF:4,\n2.m4s\n#EXT-X-ENDLIST\n', BASE),
-    (err) => err.code === 'UNSUPPORTED',
+    hasCode('UNSUPPORTED'),
   );
-  assert.throws(() => parseHls('not a playlist', BASE), (err) => err.code === 'NOT_A_STREAM');
+  assert.throws(() => parseHls('not a playlist', BASE), hasCode('NOT_A_STREAM'));
 });
 
 test('attribute lists keep commas inside quotes', () => {
@@ -155,7 +175,7 @@ test('attribute lists keep commas inside quotes', () => {
 });
 
 test('quality selection uses real variants and explains substitutions', () => {
-  const variants = parseHls(MASTER, BASE).variants.filter((v) => v.hasVideo);
+  const variants = master(MASTER).variants.filter((v) => v.hasVideo);
   const best = selectVideo(variants, 'best');
   assert.equal(best.variant.height, 1080);
   assert.equal(best.notice, null);
@@ -166,11 +186,11 @@ test('quality selection uses real variants and explains substitutions', () => {
 
   const below = selectVideo(variants, '1440');
   assert.equal(below.variant.height, 1080);
-  assert.match(below.notice, /1440p não está disponível; usado 1080p/);
+  assert.match(below.notice ?? '', /1440p não está disponível; usado 1080p/);
 
   const tooSmall = selectVideo(variants, '240');
   assert.equal(tooSmall.variant.height, 360);
-  assert.match(tooSmall.notice, /menor resolução/);
+  assert.match(tooSmall.notice ?? '', /menor resolução/);
 
   // Vertical video: the limit applies to the smaller side, as in the yt-dlp path.
   const vertical = selectVideo([{ width: 1080, height: 1920, bandwidth: 1 }, { width: 720, height: 1280, bandwidth: 1 }], '1080');
@@ -185,7 +205,7 @@ test('quality selection uses real variants and explains substitutions', () => {
 
   const unknown = selectVideo([{ bandwidth: 1e6 }, { bandwidth: 3e6 }], '720');
   assert.equal(unknown.variant.bandwidth, 3e6);
-  assert.match(unknown.notice, /não informa resoluções/);
+  assert.match(unknown.notice ?? '', /não informa resoluções/);
 });
 
 const MPD = `<?xml version="1.0" encoding="UTF-8"?>
@@ -236,24 +256,24 @@ test('DASH static manifest: templates, timelines, lists, base URLs and tracks', 
   assert.equal(d.protocol, 'dash');
   assert.equal(d.duration, 10.5);
   assert.equal(d.video.length, 3);
-  const v1080 = d.video.find((r) => r.id === 'v1080');
-  assert.equal(v1080.init.url, 'https://media.example.com/v/v1080/init.mp4');
+  const v1080 = must(d.video.find((r) => r.id === 'v1080'));
+  assert.equal(must(v1080.init).url, 'https://media.example.com/v/v1080/init.mp4');
   assert.equal(v1080.segments.length, 3, 'ceil(10.5 / 4)');
   assert.equal(v1080.segments[2].url, 'https://media.example.com/v/v1080/seg-00003.m4s');
 
-  const en = d.audio.find((r) => r.id === 'a-en');
+  const en = must(d.audio.find((r) => r.id === 'a-en'));
   assert.deepEqual(en.segments.map((s) => s.url.split('/').pop()), ['0.m4s', '192000.m4s', '384000.m4s']);
   assert.equal(en.language, 'en');
   assert.equal(en.segments[2].duration, 2);
 
-  const hi = d.audio.find((r) => r.id === 'a-pt-hi');
+  const hi = must(d.audio.find((r) => r.id === 'a-pt-hi'));
   assert.equal(hi.segments.length, 1);
   assert.equal(hi.segments[0].url, 'https://media.example.com/v/audio/pt-192k.mp4');
   // The main-role adaptation set wins, at its highest bitrate.
-  assert.equal(selectDashAudio(d.audio).id, 'a-pt-hi');
+  assert.equal(must(selectDashAudio(d.audio)).id, 'a-pt-hi');
 
-  const list = d.video.find((r) => r.id === 'list');
-  assert.equal(list.init.url, 'https://media.example.com/v/list/init.mp4');
+  const list = must(d.video.find((r) => r.id === 'list'));
+  assert.equal(must(list.init).url, 'https://media.example.com/v/list/init.mp4');
   assert.deepEqual(list.segments[1].range, { offset: 100, length: 100 });
 
   assert.equal(d.subtitles.length, 1);
@@ -264,11 +284,11 @@ test('DASH static manifest: templates, timelines, lists, base URLs and tracks', 
 test('DASH with DRM, live or several periods is rejected', () => {
   const protectedMpd = MPD.replace('<Representation id="v720"',
     '<ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"/><Representation id="v720"');
-  assert.throws(() => parseDash(protectedMpd, BASE), (err) => err.code === 'DRM');
-  assert.throws(() => parseDash(MPD.replace('type="static"', 'type="dynamic"'), BASE), (err) => err.code === 'LIVE');
+  assert.throws(() => parseDash(protectedMpd, BASE), hasCode('DRM'));
+  assert.throws(() => parseDash(MPD.replace('type="static"', 'type="dynamic"'), BASE), hasCode('LIVE'));
   const twoPeriods = MPD.replace('</Period>', '</Period><Period id="ad"></Period>');
-  assert.throws(() => parseDash(twoPeriods, BASE), (err) => err.code === 'UNSUPPORTED');
-  assert.throws(() => parseManifest('<!DOCTYPE x [<!ENTITY a "b">]><MPD/>', BASE), (err) => err.code === 'MANIFEST');
+  assert.throws(() => parseDash(twoPeriods, BASE), hasCode('UNSUPPORTED'));
+  assert.throws(() => parseManifest('<!DOCTYPE x [<!ENTITY a "b">]><MPD/>', BASE), hasCode('MANIFEST'));
 });
 
 test('XML parser handles entities, CDATA, namespaces and malformed input', () => {
@@ -298,7 +318,7 @@ test('manifest detection by URL and MIME type', () => {
 });
 
 test('encrypted MP4 init segments are detected', () => {
-  const box = (type, payload = Buffer.alloc(0)) => {
+  const box = (type: string, payload: Buffer = Buffer.alloc(0)): Buffer => {
     const header = Buffer.alloc(8);
     header.writeUInt32BE(8 + payload.length, 0);
     header.write(type, 4, 'latin1');

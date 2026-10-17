@@ -1,19 +1,33 @@
-'use strict';
-
 const APP = 'http://127.0.0.1:47900';
 // The app rejects requests without this header, which web pages cannot send
 // to it without a CORS preflight.
 const APP_HEADERS = { 'X-Meu-Downloader': '1' };
 const CONFIG_TTL_MS = 10_000;
 
-let cachedConfig = null;
+/** What the app answers on /ping. */
+export interface AppConfig {
+  app: string;
+  version: string;
+  captureEnabled: boolean;
+  captureExtensions: string[];
+  minCaptureSizeKB: number;
+}
+
+/** Reply to the popup's { type: 'status' } message. */
+export interface StatusReply {
+  connected: boolean;
+  config: AppConfig | null;
+  enabled: boolean;
+}
+
+let cachedConfig: AppConfig | null = null;
 let cachedAt = 0;
 
-async function getConfig(force = false) {
+async function getConfig(force = false): Promise<AppConfig | null> {
   if (!force && Date.now() - cachedAt < CONFIG_TTL_MS) return cachedConfig;
   try {
     const res = await fetch(`${APP}/ping`, { headers: APP_HEADERS });
-    cachedConfig = res.ok ? await res.json() : null;
+    cachedConfig = res.ok ? await res.json() as AppConfig : null;
   } catch {
     cachedConfig = null;
   }
@@ -22,12 +36,12 @@ async function getConfig(force = false) {
   return cachedConfig;
 }
 
-async function isEnabled() {
-  const { enabled = true } = await chrome.storage.local.get('enabled');
+async function isEnabled(): Promise<boolean> {
+  const { enabled = true } = await chrome.storage.local.get<{ enabled?: boolean }>('enabled');
   return enabled;
 }
 
-async function updateBadge() {
+async function updateBadge(): Promise<void> {
   const enabled = await isEnabled();
   const text = !enabled ? 'OFF' : cachedConfig ? '' : '!';
   await chrome.action.setBadgeText({ text });
@@ -38,16 +52,16 @@ async function updateBadge() {
   });
 }
 
-function extensionOf(name) {
+function extensionOf(name: string | undefined): string {
   const match = /\.([a-z0-9]{1,8})$/i.exec(name ?? '');
-  return match ? match[1].toLowerCase() : '';
+  return match?.[1]?.toLowerCase() ?? '';
 }
 
-function baseName(filePath) {
-  return (filePath ?? '').split(/[\\/]/).pop();
+function baseName(filePath: string | undefined): string {
+  return (filePath ?? '').split(/[\\/]/).pop() ?? '';
 }
 
-function urlPathName(url) {
+function urlPathName(url: string): string {
   try {
     return decodeURIComponent(new URL(url).pathname.split('/').pop() ?? '');
   } catch {
@@ -55,7 +69,7 @@ function urlPathName(url) {
   }
 }
 
-async function cookieHeader(url) {
+async function cookieHeader(url: string): Promise<string | null> {
   try {
     const cookies = await chrome.cookies.getAll({ url });
     return cookies.map((c) => `${c.name}=${c.value}`).join('; ') || null;
@@ -64,7 +78,7 @@ async function cookieHeader(url) {
   }
 }
 
-async function sendToApp({ url, referrer, fileName }) {
+async function sendToApp({ url, referrer, fileName }: { url: string; referrer?: string | undefined; fileName?: string | undefined }): Promise<boolean> {
   const body = {
     url,
     referrer: referrer || null,
@@ -84,7 +98,7 @@ async function sendToApp({ url, referrer, fileName }) {
   }
 }
 
-async function shouldCapture(item) {
+async function shouldCapture(item: chrome.downloads.DownloadItem): Promise<boolean> {
   if (!(await isEnabled())) return false;
   const url = item.finalUrl || item.url;
   if (!/^https?:/i.test(url)) return false;
@@ -119,7 +133,7 @@ chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
   return true;
 });
 
-function createMenus() {
+function createMenus(): void {
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({
       id: 'link',
@@ -156,14 +170,14 @@ chrome.contextMenus.onClicked.addListener(async (info) => {
 
 chrome.runtime.onInstalled.addListener(() => {
   createMenus();
-  getConfig(true);
+  void getConfig(true);
 });
-chrome.runtime.onStartup.addListener(() => getConfig(true));
-chrome.storage.onChanged.addListener(() => updateBadge());
+chrome.runtime.onStartup.addListener(() => void getConfig(true));
+chrome.storage.onChanged.addListener(() => void updateBadge());
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message: { type?: string } | undefined, _sender, sendResponse: (reply: StatusReply) => void) => {
   if (message?.type === 'status') {
-    Promise.all([getConfig(true), isEnabled()]).then(([config, enabled]) => sendResponse({ connected: !!config, config, enabled }));
+    void Promise.all([getConfig(true), isEnabled()]).then(([config, enabled]) => sendResponse({ connected: !!config, config, enabled }));
     return true;
   }
   return false;

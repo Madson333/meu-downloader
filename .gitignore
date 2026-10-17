@@ -1,3 +1,6 @@
 node_modules/
 *.mdpart
 bin/
+# Build output (npm run build)
+dist/
+extension/*.js

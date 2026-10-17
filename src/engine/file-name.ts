@@ -1,11 +1,9 @@
-'use strict';
-
-const fs = require('node:fs');
-const path = require('node:path');
+import fs from 'node:fs';
+import path from 'node:path';
 
 const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
 
-function sanitize(name) {
+export function sanitize(name: unknown): string {
   let clean = String(name)
     .replace(/[\u0000-\u001f<>:"/\\|?*]/g, '_')
     .replace(/[. ]+$/, '')
@@ -21,10 +19,10 @@ function sanitize(name) {
 }
 
 /** Reads the file name from Content-Disposition, preferring RFC 5987 filename*. */
-function fromContentDisposition(header) {
+export function fromContentDisposition(header: string | undefined | null): string | null {
   if (!header) return null;
   const extended = /filename\*\s*=\s*([^']*)'[^']*'([^;]+)/i.exec(header);
-  if (extended) {
+  if (extended?.[2]) {
     try {
       return decodeURIComponent(extended[2].trim().replace(/^"|"$/g, ''));
     } catch {
@@ -32,12 +30,13 @@ function fromContentDisposition(header) {
     }
   }
   const quoted = /filename\s*=\s*"((?:[^"\\]|\\.)*)"/i.exec(header);
-  if (quoted) return quoted[1].replace(/\\(.)/g, '$1');
+  if (quoted?.[1] !== undefined) return quoted[1].replace(/\\(.)/g, '$1');
   const plain = /filename\s*=\s*([^;]+)/i.exec(header);
-  return plain ? plain[1].trim() : null;
+  return plain?.[1] ? plain[1].trim() : null;
 }
 
-function fromUrl(url) {
+function fromUrl(url: string | undefined | null): string | null {
+  if (!url) return null;
   try {
     const last = new URL(url).pathname.split('/').filter(Boolean).pop();
     return last ? decodeURIComponent(last) : null;
@@ -46,14 +45,19 @@ function fromUrl(url) {
   }
 }
 
-function chooseFileName({ contentDisposition, finalUrl, originalUrl, suggested }) {
+export function chooseFileName({ contentDisposition, finalUrl, originalUrl, suggested }: {
+  contentDisposition?: string | undefined;
+  finalUrl?: string | null;
+  originalUrl?: string | null;
+  suggested?: string | null | undefined;
+}): string {
   return sanitize(
     suggested || fromContentDisposition(contentDisposition) || fromUrl(finalUrl) || fromUrl(originalUrl) || 'download',
   );
 }
 
 /** Returns a path in dir that does not collide with existing or reserved files. */
-function uniquePath(dir, name, isTaken = () => false) {
+export function uniquePath(dir: string, name: string, isTaken: (candidate: string) => boolean = () => false): string {
   const ext = path.extname(name);
   const base = name.slice(0, name.length - ext.length);
   for (let i = 0; ; i++) {
@@ -63,5 +67,3 @@ function uniquePath(dir, name, isTaken = () => false) {
     }
   }
 }
-
-module.exports = { sanitize, fromContentDisposition, chooseFileName, uniquePath };

@@ -1,24 +1,74 @@
-'use strict';
-
-const fs = require('node:fs');
-const path = require('node:path');
-const dns = require('node:dns');
-const crypto = require('node:crypto');
-const { EventEmitter } = require('node:events');
-const { request, fetchBody, isPrivateAddress, HttpError } = require('./http-client');
-const { sanitize, uniquePath } = require('./file-name');
-const {
+import fs from 'node:fs';
+import path from 'node:path';
+import dns from 'node:dns';
+import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import type { OutgoingHttpHeaders } from 'node:http';
+import { request, fetchBody, isPrivateAddress, HttpError, type RequestOptions } from './http-client';
+import { sanitize, uniquePath } from './file-name';
+import {
   ManifestError, parseManifest, parseHls, selectVideo, selectDashAudio, pickDefault, describeVideo, isProtectedMp4,
-} = require('./manifest');
-const { remux, probeStreams } = require('./ffmpeg');
+  type DashManifest, type DashRepresentation, type HlsMaster, type HlsMedia, type InitSegment, type MediaSegment,
+} from './manifest';
+import { remux, probeStreams, type RemuxInput, type StreamTools } from './ffmpeg';
+import type { SpeedLimiter } from './speed-limiter';
+import { asCodedError, type BaseState, type CodedError, type Download, type InitialState } from './types';
+import type { Quality, StreamProtocol, StreamSelection } from '../shared/api';
 
 const MAX_ATTEMPTS = 6;
-const TEMP_SUFFIX = '.mdstream';
+export const TEMP_SUFFIX = '.mdstream';
 const MAX_SUBTITLES = 20;
 const GENERIC_NAME = /^(master|index|playlist|manifest|stream|main|video|audio|media|chunklist.*|prog_index|hls|dash|output|default)$/i;
-const NATIVE_EXT = { ts: 'ts', mp4: 'mp4', webm: 'webm', aac: 'aac', mp3: 'mp3', ac3: 'ac3', eac3: 'eac3', vtt: 'vtt' };
 
-const sleep = (ms, signal) => new Promise((resolve, reject) => {
+type Container = 'ts' | 'mp4' | 'webm' | 'aac' | 'mp3' | 'ac3' | 'eac3' | 'vtt';
+const NATIVE_EXT: Record<Container, string> = { ts: 'ts', mp4: 'mp4', webm: 'webm', aac: 'aac', mp3: 'mp3', ac3: 'ac3', eac3: 'eac3', vtt: 'vtt' };
+
+/** "main" holds video and audio together; "video"/"audio" are separate renditions. */
+type TrackType = 'main' | 'video' | 'audio' | 'subtitle';
+
+interface Track {
+  type: TrackType;
+  language: string | null;
+  label: string | null;
+  container: Container;
+  init: InitSegment | null;
+  segments: MediaSegment[];
+  /** Finished segments of this track (bytes written and count). */
+  stats: { bytes: number; count: number };
+  assembled: boolean;
+  assembledSize: number;
+}
+
+interface WorkItem {
+  track: number;
+  /** -1 is the init segment. */
+  index: number;
+}
+
+interface Plan {
+  tracks: Track[];
+  extractAudio: boolean;
+  selection: StreamSelection;
+  audioOnly: boolean;
+  fingerprint: string;
+  pending: WorkItem[];
+}
+
+type PartialPlan = Pick<Plan, 'tracks' | 'extractAudio' | 'selection'>;
+
+export interface StreamState extends BaseState {
+  kind: 'stream';
+  quality: Quality;
+  notices: string[];
+  chunks: { done: number; total: number };
+  downloadedBytes: number;
+  protocol?: StreamProtocol;
+  selection?: StreamSelection;
+  fingerprint?: string;
+  sizeEstimated?: boolean;
+}
+
+const sleep = (ms: number, signal: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
   const timer = setTimeout(resolve, ms);
   signal.addEventListener('abort', () => {
     clearTimeout(timer);
@@ -26,8 +76,25 @@ const sleep = (ms, signal) => new Promise((resolve, reject) => {
   }, { once: true });
 });
 
+function makeTrack(type: TrackType, container: Container, init: InitSegment | null, segments: MediaSegment[], meta: {
+  language?: string | null;
+  label?: string | null;
+} = {}): Track {
+  return {
+    type,
+    language: meta.language ?? null,
+    label: meta.label ?? null,
+    container,
+    init,
+    segments,
+    stats: { bytes: 0, count: 0 },
+    assembled: false,
+    assembledSize: 0,
+  };
+}
+
 /** A readable file name for a manifest URL such as .../my-show/ep1/master.m3u8 → "ep1". */
-function streamBaseName(url, suggested = null) {
+export function streamBaseName(url: string, suggested: string | null = null): string {
   if (suggested) return sanitize(String(suggested).replace(/\.(m3u8|mpd|mp4|mkv|ts|m4a|mka)$/i, ''));
   try {
     const parsed = new URL(url);
@@ -39,7 +106,7 @@ function streamBaseName(url, suggested = null) {
       }
     });
     for (let i = parts.length - 1; i >= 0; i--) {
-      const name = parts[i].replace(/\.[a-z0-9]{1,5}$/i, '');
+      const name = (parts[i] ?? '').replace(/\.[a-z0-9]{1,5}$/i, '');
       if (name && !GENERIC_NAME.test(name)) return sanitize(name);
     }
     return sanitize(parsed.hostname);
@@ -48,35 +115,42 @@ function streamBaseName(url, suggested = null) {
   }
 }
 
-function containerOf(media, type) {
+function containerOf(media: HlsMedia, type: TrackType): Container {
   if (media.map) return 'mp4';
-  const first = media.segments[0]?.url ?? '';
-  const ext = (/\.([a-z0-9]{2,5})$/i.exec(new URL(first).pathname)?.[1] ?? '').toLowerCase();
+  const first = media.segments[0]?.url;
+  const ext = first ? (/\.([a-z0-9]{2,5})$/i.exec(new URL(first).pathname)?.[1] ?? '').toLowerCase() : '';
   if (ext === 'ts' || ext === 'm2ts' || ext === 'mts') return 'ts';
   if (ext === 'vtt' || ext === 'webvtt') return 'vtt';
-  if (['aac', 'mp3', 'ac3'].includes(ext)) return ext;
+  if (ext === 'aac' || ext === 'mp3' || ext === 'ac3') return ext;
   if (ext === 'ec3') return 'eac3';
   if (/^(m4s|mp4|m4a|m4v|cmf[av])$/.test(ext)) return 'mp4';
   return type === 'subtitle' ? 'vtt' : 'ts';
 }
 
-function dashContainer(rep) {
+function dashContainer(rep: DashRepresentation): Container {
   const mime = String(rep.mimeType ?? '');
   if (mime.includes('webm')) return 'webm';
   if (mime === 'text/vtt' || /\.vtt$/i.test(rep.segments[0]?.url ?? '')) return 'vtt';
   return 'mp4';
 }
 
-function withoutQuery(url) {
+function withoutQuery(url: string): string {
   const u = new URL(url);
   return u.origin + u.pathname;
 }
 
-function friendlyError(err) {
-  if (err?.code === 'ENOSPC') return 'Sem espaço em disco';
-  if (err?.code === 'EACCES' || err?.code === 'EPERM') return 'Sem permissão para gravar na pasta de destino';
-  if (err?.code === 'ENOENT' && err?.syscall === 'spawn') return 'FFmpeg não encontrado na pasta bin do app';
-  return err?.message || String(err);
+function friendlyError(err: CodedError): string {
+  if (err.code === 'ENOSPC') return 'Sem espaço em disco';
+  if (err.code === 'EACCES' || err.code === 'EPERM') return 'Sem permissão para gravar na pasta de destino';
+  if (err.code === 'ENOENT' && err.syscall === 'spawn') return 'FFmpeg não encontrado na pasta bin do app';
+  return err.message || String(err);
+}
+
+export interface StreamOptions {
+  limiter: SpeedLimiter;
+  getMaxConnections: () => number;
+  tools?: StreamTools | null;
+  isPathTaken?: (candidate: string) => boolean;
 }
 
 /**
@@ -91,8 +165,23 @@ function friendlyError(err) {
  * carry expiring tokens, and a fingerprint of the segment list tells whether
  * it still describes the same content.
  */
-class StreamDownload extends EventEmitter {
-  constructor(state, { limiter, getMaxConnections, tools = null, isPathTaken = () => false }) {
+export class StreamDownload extends EventEmitter implements Download {
+  readonly state: StreamState;
+  private readonly limiter: SpeedLimiter;
+  private readonly getMaxConnections: () => number;
+  private readonly tools: StreamTools | null;
+  private readonly isPathTaken: (candidate: string) => boolean;
+  private controller = new AbortController();
+  private running: Promise<void> | null = null;
+  private pauseRequested = false;
+  private allowPrivate = false;
+  private active = 0;
+  /** Bytes of finished segments; null until the temporary folder has been scanned. */
+  private doneBytes: number | null = null;
+  private inflightBytes = 0;
+  private readonly keys = new Map<string, Promise<Buffer>>();
+
+  constructor(state: InitialState<StreamState>, { limiter, getMaxConnections, tools = null, isPathTaken = () => false }: StreamOptions) {
     super();
     this.state = {
       status: 'queued',
@@ -109,27 +198,21 @@ class StreamDownload extends EventEmitter {
     this.getMaxConnections = getMaxConnections;
     this.tools = tools;
     this.isPathTaken = isPathTaken;
-    this.controller = null;
-    this.running = null;
-    this.active = 0;
-    this.doneBytes = null;
-    this.inflightBytes = 0;
-    this.keys = new Map();
   }
 
-  get downloaded() {
+  get downloaded(): number {
     return this.doneBytes === null ? (this.state.downloadedBytes ?? 0) : this.doneBytes + this.inflightBytes;
   }
 
-  get activeConnections() {
+  get activeConnections(): number {
     return this.active;
   }
 
-  get tempDir() {
+  get tempDir(): string {
     return path.join(this.state.dir, `${this.state.id}${TEMP_SUFFIX}`);
   }
 
-  #setStatus(status, error = null, errorCode = null) {
+  #setStatus(status: StreamState['status'], error: string | null = null, errorCode: string | null = null): void {
     this.state.status = status;
     this.state.error = error;
     this.state.errorCode = errorCode;
@@ -137,14 +220,14 @@ class StreamDownload extends EventEmitter {
     this.emit('change', this);
   }
 
-  #phase(text) {
+  #phase(text: string | null): void {
     this.state.phase = text;
     this.emit('change', this);
   }
 
-  #headers(extra = {}) {
+  #headers(extra: OutgoingHttpHeaders = {}): OutgoingHttpHeaders {
     const h = this.state.headers ?? {};
-    const headers = {
+    const headers: OutgoingHttpHeaders = {
       'User-Agent': h.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
       Accept: '*/*',
       'Accept-Encoding': 'identity',
@@ -156,7 +239,7 @@ class StreamDownload extends EventEmitter {
   }
 
   /** Options shared by every request after the manifest. */
-  #net(extraHeaders = {}) {
+  #net(extraHeaders: OutgoingHttpHeaders = {}): RequestOptions {
     return {
       headers: this.#headers(extraHeaders),
       signal: this.controller.signal,
@@ -167,7 +250,7 @@ class StreamDownload extends EventEmitter {
     };
   }
 
-  start() {
+  start(): Promise<void> {
     if (this.running) return this.running;
     this.controller = new AbortController();
     this.#setStatus('downloading');
@@ -177,7 +260,7 @@ class StreamDownload extends EventEmitter {
     return this.running;
   }
 
-  async pause() {
+  async pause(): Promise<void> {
     if (!this.running) {
       if (this.state.status !== 'completed') this.#setStatus('paused');
       return;
@@ -187,11 +270,11 @@ class StreamDownload extends EventEmitter {
     await this.running;
   }
 
-  async discardTemp() {
+  async discardTemp(): Promise<void> {
     await fs.promises.rm(this.tempDir, { recursive: true, force: true });
   }
 
-  async #run() {
+  async #run(): Promise<void> {
     this.pauseRequested = false;
     try {
       const plan = await this.#plan();
@@ -199,18 +282,19 @@ class StreamDownload extends EventEmitter {
       await this.#downloadSegments(plan);
       await this.#assemble(plan);
       await this.#finish(plan);
-    } catch (err) {
+    } catch (caught) {
+      const err = asCodedError(caught);
       this.active = 0;
       this.inflightBytes = 0;
       this.state.downloadedBytes = this.downloaded;
       if (this.pauseRequested) this.#setStatus('paused');
-      else this.#setStatus('error', friendlyError(err), err?.code ?? null);
+      else this.#setStatus('error', friendlyError(err), err.code ?? null);
     }
   }
 
   // ---------------------------------------------------------------- planning
 
-  async #plan() {
+  async #plan(): Promise<Plan> {
     this.#phase('Lendo o manifesto…');
     const host = new URL(this.state.url).hostname;
     this.allowPrivate = isPrivateAddress(host) || host === 'localhost'
@@ -223,54 +307,53 @@ class StreamDownload extends EventEmitter {
       cookieHost: host,
     });
     const manifest = parseManifest(body.toString('utf8'), finalUrl);
-    const notices = [];
-    const plan = manifest.protocol === 'hls'
+    const notices: string[] = [];
+    const partial = manifest.protocol === 'hls'
       ? await this.#planHls(manifest, notices)
       : this.#planDash(manifest, notices);
 
-    plan.audioOnly = this.state.quality === 'audio';
-    plan.fingerprint = crypto.createHash('sha1').update(JSON.stringify(plan.tracks.map((t) => [
+    const fingerprint = crypto.createHash('sha1').update(JSON.stringify(partial.tracks.map((t) => [
       t.type, t.container, t.init && [withoutQuery(t.init.url), t.init.range],
       t.segments.map((s) => [withoutQuery(s.url), s.range?.offset, s.range?.length]),
     ]))).digest('hex');
 
     this.state.protocol = manifest.protocol;
-    this.state.selection = plan.selection;
+    this.state.selection = partial.selection;
     this.state.notices = notices;
-    this.state.fileName = this.state.filePath ? this.state.fileName : streamBaseName(this.state.url, this.state.suggestedName);
+    if (!this.state.filePath) this.state.fileName = streamBaseName(this.state.url, this.state.suggestedName ?? null);
     this.state.chunks = {
       done: 0,
-      total: plan.tracks.reduce((sum, t) => sum + t.segments.length + (t.init ? 1 : 0), 0),
+      total: partial.tracks.reduce((sum, t) => sum + t.segments.length + (t.init ? 1 : 0), 0),
     };
-    return plan;
+    return { ...partial, audioOnly: this.state.quality === 'audio', fingerprint, pending: [] };
   }
 
-  async #mediaPlaylist(url, type, meta = {}) {
+  async #mediaPlaylist(url: string, type: TrackType, meta: { language?: string | null; label?: string | null } = {}): Promise<Track> {
     const { body, finalUrl } = await fetchBody(url, this.#net());
     const media = parseHls(body.toString('utf8'), finalUrl);
     if (media.kind !== 'media') throw new ManifestError('Playlist de variante inválida (outra playlist principal)');
     if (media.live) throw new ManifestError('Transmissões ao vivo não são suportadas; apenas vídeos sob demanda (VOD)', 'LIVE');
     if (!media.segments.length) throw new ManifestError('Playlist sem segmentos');
-    return { type, ...meta, container: containerOf(media, type), init: media.map, segments: media.segments };
+    return makeTrack(type, containerOf(media, type), media.map, media.segments, meta);
   }
 
-  async #planHls(manifest, notices) {
+  async #planHls(manifest: HlsMaster | HlsMedia, notices: string[]): Promise<PartialPlan> {
     const quality = this.state.quality;
     if (manifest.kind === 'media') {
       if (manifest.live) throw new ManifestError('Transmissões ao vivo não são suportadas; apenas vídeos sob demanda (VOD)', 'LIVE');
       if (!manifest.segments.length) throw new ManifestError('Playlist sem segmentos');
       if (/^\d+$/.test(quality)) notices.push('A playlist tem uma única qualidade; a qualidade escolhida não se aplica');
       if (quality === 'audio') notices.push('A playlist não separa o áudio; ele será extraído do vídeo');
-      const track = { type: 'main', container: containerOf(manifest, 'main'), init: manifest.map, segments: manifest.segments };
+      const track = makeTrack('main', containerOf(manifest, 'main'), manifest.map, manifest.segments);
       return { tracks: [track], extractAudio: quality === 'audio', selection: { video: 'qualidade única' } };
     }
 
     const videoVariants = manifest.variants.filter((v) => v.hasVideo);
     const audioVariants = manifest.variants.filter((v) => !v.hasVideo);
-    const audioRenditions = manifest.renditions.filter((r) => r.type === 'audio' && r.uri);
-    const describeAudio = (r) => [r.name, r.language].filter(Boolean).join(' · ') || 'padrão';
-    const tracks = [];
-    const selection = {};
+    const audioRenditions = manifest.renditions.filter((r): r is typeof r & { uri: string } => r.type === 'audio' && !!r.uri);
+    const describeAudio = (r: { name: string | null; language: string | null }): string => [r.name, r.language].filter(Boolean).join(' · ') || 'padrão';
+    const tracks: Track[] = [];
+    const selection: StreamSelection = {};
 
     if (quality === 'audio') {
       const reference = selectVideo(videoVariants.length ? videoVariants : manifest.variants, 'best').variant;
@@ -279,18 +362,19 @@ class StreamDownload extends EventEmitter {
       if (rendition) {
         tracks.push(await this.#mediaPlaylist(rendition.uri, 'audio', { language: rendition.language, label: rendition.name }));
         selection.audio = describeAudio(rendition);
-      } else if (audioVariants.length) {
-        const best = [...audioVariants].sort((a, b) => b.bandwidth - a.bandwidth)[0];
+        return { tracks, extractAudio: false, selection };
+      }
+      const best = [...audioVariants].sort((a, b) => b.bandwidth - a.bandwidth)[0];
+      if (best) {
         tracks.push(await this.#mediaPlaylist(best.uri, 'audio'));
         selection.audio = best.bandwidth ? `${Math.round(best.bandwidth / 1000)} kbps` : 'padrão';
-      } else {
-        const smallest = [...videoVariants].sort((a, b) => a.bandwidth - b.bandwidth)[0];
-        notices.push('A fonte não oferece uma faixa só de áudio; o áudio será extraído da menor variante de vídeo');
-        tracks.push(await this.#mediaPlaylist(smallest.uri, 'main'));
-        selection.audio = 'extraído do vídeo';
-        return { tracks, extractAudio: true, selection };
+        return { tracks, extractAudio: false, selection };
       }
-      return { tracks, extractAudio: false, selection };
+      const smallest = [...videoVariants].sort((a, b) => a.bandwidth - b.bandwidth)[0] ?? reference;
+      notices.push('A fonte não oferece uma faixa só de áudio; o áudio será extraído da menor variante de vídeo');
+      tracks.push(await this.#mediaPlaylist(smallest.uri, 'main'));
+      selection.audio = 'extraído do vídeo';
+      return { tracks, extractAudio: true, selection };
     }
 
     const { variant, notice } = selectVideo(videoVariants.length ? videoVariants : manifest.variants, quality);
@@ -312,7 +396,7 @@ class StreamDownload extends EventEmitter {
     for (const sub of subtitles.slice(0, MAX_SUBTITLES)) {
       const name = sub.name || sub.language || 'legenda';
       try {
-        const track = await this.#mediaPlaylist(sub.uri, 'subtitle', { language: sub.language, label: sub.name });
+        const track = await this.#mediaPlaylist(sub.uri ?? '', 'subtitle', { language: sub.language, label: sub.name });
         if (track.container !== 'vtt' || track.init) {
           notices.push(`Legenda "${name}" ignorada: formato não suportado (apenas WebVTT)`);
           continue;
@@ -321,26 +405,21 @@ class StreamDownload extends EventEmitter {
         selection.subtitles.push(name);
       } catch (err) {
         if (this.controller.signal.aborted) throw err;
-        notices.push(`Legenda "${name}" ignorada: ${err.message}`);
+        notices.push(`Legenda "${name}" ignorada: ${asCodedError(err).message}`);
       }
     }
     return { tracks, extractAudio: false, selection };
   }
 
-  #planDash(manifest, notices) {
+  #planDash(manifest: DashManifest, notices: string[]): PartialPlan {
     const quality = this.state.quality;
-    const track = (type, rep) => ({
-      type,
-      language: rep.language,
-      label: rep.label,
-      container: dashContainer(rep),
-      init: rep.init,
-      segments: rep.segments,
-    });
-    const tracks = [];
-    const selection = {};
+    const track = (type: TrackType, rep: DashRepresentation): Track => makeTrack(
+      type, dashContainer(rep), rep.init, rep.segments, { language: rep.language, label: rep.label },
+    );
+    const tracks: Track[] = [];
+    const selection: StreamSelection = {};
     const audio = selectDashAudio(manifest.audio);
-    const describeAudio = (rep) => [rep.label, rep.language, rep.bandwidth && `${Math.round(rep.bandwidth / 1000)} kbps`]
+    const describeAudio = (rep: DashRepresentation): string => [rep.label, rep.language, rep.bandwidth && `${Math.round(rep.bandwidth / 1000)} kbps`]
       .filter(Boolean).join(' · ');
 
     if (quality === 'audio' || !manifest.video.length) {
@@ -361,7 +440,7 @@ class StreamDownload extends EventEmitter {
     }
 
     selection.subtitles = [];
-    const seen = new Set();
+    const seen = new Set<number>();
     for (const rep of manifest.subtitles) {
       if (seen.has(rep.adaptationIndex) || seen.size >= MAX_SUBTITLES) continue;
       seen.add(rep.adaptationIndex);
@@ -378,20 +457,25 @@ class StreamDownload extends EventEmitter {
 
   // ---------------------------------------------------------------- files
 
-  #segPath(trackIndex, index) {
+  #segPath(trackIndex: number, index: number): string {
     return path.join(this.tempDir, `t${trackIndex}-${index < 0 ? 'init' : String(index).padStart(6, '0')}.seg`);
   }
 
-  #trackPath(trackIndex, track) {
-    return path.join(this.tempDir, `t${trackIndex}.${NATIVE_EXT[track.container] ?? 'bin'}`);
+  #trackPath(trackIndex: number, track: Track): string {
+    return path.join(this.tempDir, `t${trackIndex}.${NATIVE_EXT[track.container]}`);
+  }
+
+  #part(track: Track, index: number): InitSegment | MediaSegment {
+    const part = index < 0 ? track.init : track.segments[index];
+    if (!part) throw new Error(`Segmento ${index} inexistente`);
+    return part;
   }
 
   /** Checks the temporary folder against the plan and counts what is already done. */
-  async #prepare(plan) {
+  async #prepare(plan: Plan): Promise<void> {
     const dir = this.tempDir;
     if (this.state.fingerprint && this.state.fingerprint !== plan.fingerprint && fs.existsSync(dir)) {
       await this.discardTemp();
-      plan.restarted = true;
       this.state.notices.push('O conteúdo do manifesto mudou desde a última sessão; o download recomeçou do início');
     }
     this.state.fingerprint = plan.fingerprint;
@@ -401,7 +485,6 @@ class StreamDownload extends EventEmitter {
     this.doneBytes = 0;
     plan.pending = [];
     for (const [ti, track] of plan.tracks.entries()) {
-      track.stats = { bytes: 0, count: 0 };
       const assembled = this.#trackPath(ti, track);
       if (present.has(path.basename(assembled))) {
         track.assembled = true;
@@ -413,11 +496,12 @@ class StreamDownload extends EventEmitter {
       const items = track.init ? [-1, ...track.segments.keys()] : [...track.segments.keys()];
       for (const index of items) {
         const file = this.#segPath(ti, index);
-        const seg = index < 0 ? track.init : track.segments[index];
+        const seg = this.#part(track, index);
         if (present.has(path.basename(file))) {
           const { size } = await fs.promises.stat(file);
           // A ranged, unencrypted segment must have exactly the requested size.
-          if (!(seg.range && !seg.key && size !== seg.range.length)) {
+          const key = 'key' in seg ? seg.key : null;
+          if (!(seg.range && !key && size !== seg.range.length)) {
             this.#countDone(track, size);
             continue;
           }
@@ -431,15 +515,15 @@ class StreamDownload extends EventEmitter {
     this.#updateEstimate(plan);
   }
 
-  #countDone(track, size) {
+  #countDone(track: Track, size: number): void {
     track.stats.bytes += size;
     track.stats.count++;
-    this.doneBytes += size;
+    this.doneBytes = (this.doneBytes ?? 0) + size;
     this.state.chunks.done++;
   }
 
   /** Total size: exact for byte-range tracks, otherwise extrapolated from finished segments. */
-  #updateEstimate(plan) {
+  #updateEstimate(plan: Plan): void {
     let total = 0;
     let exact = true;
     for (const track of plan.tracks) {
@@ -447,9 +531,9 @@ class StreamDownload extends EventEmitter {
         total += track.assembledSize;
         continue;
       }
-      const parts = [...(track.init ? [track.init] : []), ...track.segments];
-      if (parts.every((s) => s.range && !s.key)) {
-        total += parts.reduce((sum, s) => sum + s.range.length, 0);
+      const parts: (InitSegment | MediaSegment)[] = [...(track.init ? [track.init] : []), ...track.segments];
+      if (parts.every((s) => s.range && !('key' in s && s.key))) {
+        total += parts.reduce((sum, s) => sum + (s.range?.length ?? 0), 0);
         continue;
       }
       if (!track.stats.count) {
@@ -465,14 +549,15 @@ class StreamDownload extends EventEmitter {
 
   // ---------------------------------------------------------------- download
 
-  async #downloadSegments(plan) {
+  async #downloadSegments(plan: Plan): Promise<void> {
     if (!plan.pending.length) return;
     this.#phase(null);
     const queue = [...plan.pending];
-    let failure = null;
-    const worker = async () => {
+    let failure: unknown = null;
+    const worker = async (): Promise<void> => {
       while (queue.length && !failure) {
         const item = queue.shift();
+        if (!item) break;
         try {
           await this.#fetchSegment(plan, item);
         } catch (err) {
@@ -488,26 +573,30 @@ class StreamDownload extends EventEmitter {
     if (failure) throw this.controller.signal.reason ?? failure;
   }
 
-  async #key(uri) {
-    if (!this.keys.has(uri)) {
-      const pending = fetchBody(uri, { ...this.#net(), maxBytes: 1024 }).then(({ body }) => {
+  #key(uri: string): Promise<Buffer> {
+    let pending = this.keys.get(uri);
+    if (!pending) {
+      pending = fetchBody(uri, { ...this.#net(), maxBytes: 1024 }).then(({ body }) => {
         if (body.length !== 16) throw new HttpError('A chave AES-128 do manifesto é inválida');
         return body;
-      }, (err) => {
-        if (err.status === 401 || err.status === 403) {
-          throw new HttpError(`O servidor recusou a chave de descriptografia (HTTP ${err.status}); o conteúdo exige autorização`);
+      }, (err: unknown) => {
+        const status = err instanceof HttpError ? err.status : null;
+        if (status === 401 || status === 403) {
+          throw new HttpError(`O servidor recusou a chave de descriptografia (HTTP ${status}); o conteúdo exige autorização`);
         }
         throw err;
       });
       pending.catch(() => this.keys.delete(uri));
       this.keys.set(uri, pending);
     }
-    return this.keys.get(uri);
+    return pending;
   }
 
-  async #fetchSegment(plan, { track: ti, index }) {
+  async #fetchSegment(plan: Plan, { track: ti, index }: WorkItem): Promise<void> {
     const track = plan.tracks[ti];
-    const seg = index < 0 ? track.init : track.segments[index];
+    if (!track) throw new Error(`Faixa ${ti} inexistente`);
+    const seg = this.#part(track, index);
+    const key = 'key' in seg ? seg.key ?? null : null;
     const file = this.#segPath(ti, index);
     const signal = this.controller.signal;
     const label = index < 0 ? 'de inicialização' : `${index + 1} de ${track.segments.length}`;
@@ -515,7 +604,7 @@ class StreamDownload extends EventEmitter {
     for (let attempt = 1; ; attempt++) {
       let received = 0;
       try {
-        const extra = seg.range ? { Range: `bytes=${seg.range.offset}-${seg.range.offset + seg.range.length - 1}` } : {};
+        const extra: OutgoingHttpHeaders = seg.range ? { Range: `bytes=${seg.range.offset}-${seg.range.offset + seg.range.length - 1}` } : {};
         const { res } = await request(seg.url, this.#net(extra));
         this.active++;
         let written = 0;
@@ -527,12 +616,12 @@ class StreamDownload extends EventEmitter {
             throw new HttpError('O servidor devolveu uma página web em vez do segmento');
           }
           const expected = res.headers['content-length'] !== undefined ? Number(res.headers['content-length']) : null;
-          const decipher = seg.key
-            ? crypto.createDecipheriv('aes-128-cbc', await this.#key(seg.key.uri), Buffer.from(seg.key.iv, 'hex'))
+          const decipher = key
+            ? crypto.createDecipheriv('aes-128-cbc', await this.#key(key.uri), Buffer.from(key.iv, 'hex'))
             : null;
           const out = await fs.promises.open(`${file}.part`, 'w');
           try {
-            for await (const chunk of res) {
+            for await (const chunk of res as AsyncIterable<Buffer>) {
               await this.limiter.take(chunk.length, signal);
               received += chunk.length;
               this.inflightBytes += chunk.length;
@@ -547,7 +636,7 @@ class StreamDownload extends EventEmitter {
               throw new HttpError('Segmento com tamanho diferente do intervalo pedido', { retryable: true });
             }
             if (decipher) {
-              let tail;
+              let tail: Buffer;
               try {
                 tail = decipher.final();
               } catch {
@@ -569,14 +658,15 @@ class StreamDownload extends EventEmitter {
         this.#countDone(track, written);
         this.#updateEstimate(plan);
         return;
-      } catch (err) {
+      } catch (caught) {
+        const err = asCodedError(caught);
         this.inflightBytes -= received;
         if (signal.aborted) throw signal.reason ?? err;
         const retryable = err.retryable || err.code === 'ECONNRESET' || err.code === 'EPIPE';
         if (!retryable || attempt >= MAX_ATTEMPTS) {
           const what = track.type === 'subtitle' ? 'Legenda' : 'Segmento';
-          const wrapped = new Error(`${what} ${label}: ${friendlyError(err)}`);
-          wrapped.code = err.code;
+          const wrapped: CodedError = new Error(`${what} ${label}: ${friendlyError(err)}`);
+          wrapped.code = err.code ?? null;
           throw wrapped;
         }
         await sleep(Math.min(30_000, 1000 * 2 ** (attempt - 1)), signal);
@@ -585,7 +675,7 @@ class StreamDownload extends EventEmitter {
   }
 
   /** Refuses MP4 data that declares encryption even when the manifest did not. */
-  async #checkProtection(file) {
+  async #checkProtection(file: string): Promise<void> {
     const handle = await fs.promises.open(file, 'r');
     try {
       const buf = Buffer.alloc(4 * 1024 * 1024);
@@ -600,20 +690,19 @@ class StreamDownload extends EventEmitter {
 
   // ---------------------------------------------------------------- assembly
 
-  async #ensureSpace(bytes) {
-    if (!fs.promises.statfs) return;
+  async #ensureSpace(bytes: number): Promise<void> {
     const stats = await fs.promises.statfs(this.state.dir).catch(() => null);
     if (stats && stats.bavail * stats.bsize < bytes) {
-      const err = new Error('Sem espaço em disco para juntar os segmentos');
+      const err: CodedError = new Error('Sem espaço em disco para juntar os segmentos');
       err.code = 'ENOSPC';
       throw err;
     }
   }
 
   /** Joins each track's segments, in order, into one file, then deletes the segments. */
-  async #assemble(plan) {
+  async #assemble(plan: Plan): Promise<void> {
     const signal = this.controller.signal;
-    const todo = plan.tracks.map((t, i) => [t, i]).filter(([t]) => !t.assembled);
+    const todo = plan.tracks.map((t, i) => [t, i] as const).filter(([t]) => !t.assembled);
     if (!todo.length) return;
     this.#phase('Juntando segmentos…');
     await this.#ensureSpace(todo.reduce((sum, [t]) => sum + t.stats.bytes, 0));
@@ -631,7 +720,7 @@ class StreamDownload extends EventEmitter {
             await out.write(`${text.replace(/\s+$/, '')}\n\n`);
             continue;
           }
-          for await (const chunk of fs.createReadStream(file)) await out.write(chunk);
+          for await (const chunk of fs.createReadStream(file) as AsyncIterable<Buffer>) await out.write(chunk);
         }
       } finally {
         await out.close();
@@ -645,24 +734,25 @@ class StreamDownload extends EventEmitter {
 
   // ---------------------------------------------------------------- output
 
-  async #finish(plan) {
+  async #finish(plan: Plan): Promise<void> {
     const signal = this.controller.signal;
-    const media = plan.tracks.map((t, i) => [t, i]).filter(([t]) => t.type !== 'subtitle');
-    const subtitles = plan.tracks.map((t, i) => [t, i]).filter(([t]) => t.type === 'subtitle');
-    const base = streamBaseName(this.state.url, this.state.suggestedName);
-    let output;
-    let ext;
+    const indexed = plan.tracks.map((t, i) => [t, i] as const);
+    const media = indexed.filter(([t]) => t.type !== 'subtitle');
+    const subtitles = indexed.filter(([t]) => t.type === 'subtitle');
+    const base = streamBaseName(this.state.url, this.state.suggestedName ?? null);
+    let output: string | null = null;
+    let ext = '';
 
     if (this.tools?.ffmpeg) {
       this.#phase(media.length > 1 ? 'Juntando áudio e vídeo (FFmpeg)…' : 'Finalizando com FFmpeg…');
       await this.#ensureSpace(media.reduce((sum, [t]) => sum + t.assembledSize, 0));
-      const inputs = media.map(([t, i]) => ({
+      const inputs: RemuxInput[] = media.map(([t, i]) => ({
         file: this.#trackPath(i, t),
         maps: t.type === 'video' ? ['v'] : t.type === 'audio' ? ['a'] : plan.audioOnly ? ['a'] : ['v?', 'a?'],
       }));
       // MP4 first; Matroska accepts codecs MP4 cannot hold.
-      const formats = plan.audioOnly ? [['m4a', 'mp4'], ['mka', 'matroska']] : [['mp4', 'mp4'], ['mkv', 'matroska']];
-      let lastError = null;
+      const formats = plan.audioOnly ? [['m4a', 'mp4'], ['mka', 'matroska']] as const : [['mp4', 'mp4'], ['mkv', 'matroska']] as const;
+      let lastError: unknown = null;
       for (const [candidateExt, format] of formats) {
         const candidate = path.join(this.tempDir, `output.${candidateExt}`);
         try {
@@ -680,9 +770,11 @@ class StreamDownload extends EventEmitter {
     } else {
       if (media.length > 1) throw new Error('FFmpeg não encontrado: ele é necessário para juntar áudio e vídeo');
       if (plan.extractAudio) throw new Error('FFmpeg não encontrado: ele é necessário para extrair o áudio');
-      const [track, ti] = media[0];
+      const [only] = media;
+      if (!only) throw new Error('O stream não tem faixas de mídia');
+      const [track, ti] = only;
       output = this.#trackPath(ti, track);
-      ext = track.container === 'mp4' && track.type === 'audio' ? 'm4a' : NATIVE_EXT[track.container] ?? 'bin';
+      ext = track.container === 'mp4' && track.type === 'audio' ? 'm4a' : NATIVE_EXT[track.container];
       this.state.notices.push(`FFmpeg não encontrado; o vídeo foi salvo no formato original (.${ext})`);
     }
 
@@ -692,7 +784,7 @@ class StreamDownload extends EventEmitter {
     if (size === 0) throw new Error('O arquivo final ficou vazio');
     if (this.tools?.ffprobe) {
       const streams = await probeStreams({ ffprobe: this.tools.ffprobe, file: output, signal });
-      const has = (type) => streams.some((s) => s.codec_type === type);
+      const has = (type: string): boolean => streams.some((s) => s.codec_type === type);
       if (!streams.length) throw new Error('O arquivo final não tem faixas de mídia');
       if (plan.audioOnly && !has('audio')) throw new Error('O arquivo final não tem áudio');
       if (media.some(([t]) => t.type === 'video') && !has('video')) throw new Error('O arquivo final não tem vídeo');
@@ -719,16 +811,13 @@ class StreamDownload extends EventEmitter {
     this.#setStatus('completed');
   }
 
-  toJSON() {
+  toJSON(): StreamState {
     const { status, ...rest } = this.state;
     return {
       ...rest,
       status: status === 'downloading' ? 'paused' : status,
       phase: null,
       downloadedBytes: this.downloaded,
-      segments: [],
     };
   }
 }
-
-module.exports = { StreamDownload, streamBaseName, TEMP_SUFFIX };

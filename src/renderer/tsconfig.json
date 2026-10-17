@@ -1,0 +1,13 @@
+{
+  // Interface (sandboxed browser window). Loaded as an ES module by index.html.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": [],
+    "rootDir": ".",
+    "outDir": "../../dist/src/renderer"
+  },
+  "include": ["*.ts", "../shared/*.d.ts"]
+}

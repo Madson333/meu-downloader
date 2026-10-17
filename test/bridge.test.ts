@@ -1,25 +1,25 @@
-'use strict';
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { once } from 'node:events';
+import type { Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { DownloadManager } from '../src/engine/download-manager';
+import { startBrowserBridge } from '../src/main/browser-bridge';
 
-const { test, before, after } = require('node:test');
-const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const { once } = require('node:events');
-const { DownloadManager } = require('../src/engine/download-manager');
-const { startBrowserBridge } = require('../src/main/browser-bridge');
-
-let manager;
-let bridge;
-let base;
-let tmp;
+let manager: DownloadManager;
+let bridge: Server;
+let base: string;
+let tmp: string;
 
 before(async () => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'md-bridge-'));
   manager = new DownloadManager({ storeDir: tmp, defaultDownloadDir: tmp });
   bridge = startBrowserBridge({ manager, version: 'test', port: 0 });
   await once(bridge, 'listening');
-  base = `http://127.0.0.1:${bridge.address().port}`;
+  base = `http://127.0.0.1:${(bridge.address() as AddressInfo).port}`;
 });
 
 after(async () => {
@@ -43,7 +43,7 @@ test('rejects requests without the client header', async () => {
 test('ping returns capture settings to the extension', async () => {
   const res = await fetch(`${base}/ping`, { headers: EXT });
   assert.equal(res.status, 200);
-  const body = await res.json();
+  const body = await res.json() as { app: string; captureExtensions: string[] };
   assert.equal(body.app, 'meu-downloader');
   assert.ok(body.captureExtensions.includes('zip'));
 });
@@ -60,10 +60,11 @@ test('accepts downloads with cookies and referrer', async () => {
     }),
   });
   assert.equal(res.status, 202);
-  const { id } = await res.json();
-  const added = manager.downloads.get(id).state;
-  assert.equal(added.headers.cookie, 'session=abc');
-  assert.equal(added.headers.referrer, 'https://example.com/page');
+  const { id } = await res.json() as { id: string };
+  const added = manager.downloads.get(id)?.state;
+  assert.ok(added);
+  assert.equal(added.headers?.cookie, 'session=abc');
+  assert.equal(added.headers?.referrer, 'https://example.com/page');
   assert.equal(added.suggestedName, 'file.zip');
 });
 
