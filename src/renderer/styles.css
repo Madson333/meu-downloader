@@ -194,6 +194,7 @@ table.list { width: 100%; border-collapse: collapse; table-layout: fixed; }
 .details-grid .wide { grid-column: 1 / -1; }
 .muted { color: var(--muted); }
 .error-text { color: var(--err); }
+.notice-text { color: var(--warn); }
 
 dialog {
   border: 1px solid var(--border);

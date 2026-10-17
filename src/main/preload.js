@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('downloader', {
   getSettings: () => ipcRenderer.invoke('settings:get'),
   updateSettings: (patch) => ipcRenderer.invoke('settings:update', patch),
   chooseFolder: (current) => ipcRenderer.invoke('dialog:chooseFolder', current),
+  chooseCookiesFile: () => ipcRenderer.invoke('dialog:chooseCookiesFile'),
   clipboardUrl: () => ipcRenderer.invoke('clipboard:url'),
   updateVideoTool: () => ipcRenderer.invoke('video:update'),
   onUpdate: (callback) => {

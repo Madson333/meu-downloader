@@ -33,6 +33,24 @@ function formatArgs(quality) {
   return ['-f', 'bv*+ba/b', '-S', `${res},fps,vcodec:h264,acodec:aac`, '--merge-output-format', 'mp4'];
 }
 
+/**
+ * Netscape cookies.txt for yt-dlp from a Cookie header. Every cookie is
+ * host-only for the page's host, so yt-dlp never sends them to other sites.
+ */
+function toNetscapeCookies(cookieHeader, url) {
+  const { hostname, protocol } = new URL(url);
+  const lines = ['# Netscape HTTP Cookie File'];
+  for (const pair of String(cookieHeader ?? '').split(';')) {
+    const at = pair.indexOf('=');
+    if (at <= 0) continue;
+    const name = pair.slice(0, at).trim();
+    const value = pair.slice(at + 1).trim();
+    if (!name || /[\t\r\n]/.test(name + value)) continue;
+    lines.push([hostname, 'FALSE', '/', protocol === 'https:' ? 'TRUE' : 'FALSE', '0', name, value].join('\t'));
+  }
+  return lines.length > 1 ? `${lines.join('\n')}\n` : null;
+}
+
 function killTree(child) {
   if (!child || child.exitCode !== null) return;
   if (process.platform === 'win32') execFile('taskkill', ['/pid', String(child.pid), '/T', '/F'], () => {});
@@ -45,12 +63,14 @@ function killTree(child) {
  * pausing kills the process and resuming runs it again with --continue.
  */
 class VideoDownload extends EventEmitter {
-  constructor(state, { tools, getSettings }) {
+  constructor(state, { tools, getSettings, sessionDir = null }) {
     super();
     // `streams` is persisted so progress and partial files survive a restart.
     this.state = { status: 'queued', segments: [], streams: {}, totalSize: null, error: null, quality: 'best', ...state, kind: 'video' };
     this.tools = tools;
     this.getSettings = getSettings;
+    this.sessionDir = sessionDir;
+    this.cookieFile = null;
     this.child = null;
     this.running = null;
     this.connections = 0;
@@ -73,6 +93,37 @@ class VideoDownload extends EventEmitter {
     this.emit('change', this);
   }
 
+  /**
+   * Writes the session file chosen in the settings and returns yt-dlp's
+   * arguments for it. yt-dlp rewrites its cookie file on exit, so a user's
+   * cookies.txt is copied first and the copy is deleted afterwards.
+   */
+  #cookieArgs() {
+    const { videoCookies, videoCookiesFile } = this.getSettings();
+    if (videoCookies === 'firefox') return ['--cookies-from-browser', 'firefox'];
+    if (videoCookies !== 'browser' && videoCookies !== 'file') return [];
+    if (!this.sessionDir) return [];
+    let content;
+    if (videoCookies === 'browser') {
+      content = toNetscapeCookies(this.state.headers?.cookie, this.state.url);
+      if (!content) return [];
+    } else {
+      const stat = videoCookiesFile ? fs.statSync(videoCookiesFile, { throwIfNoEntry: false }) : null;
+      if (!stat?.isFile()) throw new Error('Arquivo de cookies não encontrado; escolha-o de novo em Configurações');
+      if (stat.size > 10 * 1024 * 1024) throw new Error('Arquivo de cookies grande demais');
+      content = fs.readFileSync(videoCookiesFile);
+    }
+    fs.mkdirSync(this.sessionDir, { recursive: true });
+    this.cookieFile = path.join(this.sessionDir, `${this.state.id}.txt`);
+    fs.writeFileSync(this.cookieFile, content, { mode: 0o600 });
+    return ['--cookies', this.cookieFile];
+  }
+
+  #removeCookieFile() {
+    if (this.cookieFile) fs.rmSync(this.cookieFile, { force: true });
+    this.cookieFile = null;
+  }
+
   #args() {
     const settings = this.getSettings();
     const args = [
@@ -91,6 +142,7 @@ class VideoDownload extends EventEmitter {
       ...formatArgs(this.state.quality),
     ];
     if (settings.speedLimitKBps > 0) args.push('--limit-rate', `${settings.speedLimitKBps}K`);
+    args.push(...this.#cookieArgs());
     args.push('--', this.state.url);
     return args;
   }
@@ -112,7 +164,16 @@ class VideoDownload extends EventEmitter {
   #run() {
     return new Promise((resolve) => {
       fs.mkdirSync(this.state.dir, { recursive: true });
-      const child = spawn(this.tools.ytdlp, this.#args(), {
+      let args;
+      try {
+        args = this.#args();
+      } catch (err) {
+        this.#removeCookieFile();
+        this.#setStatus('error', err.message);
+        resolve();
+        return;
+      }
+      const child = spawn(this.tools.ytdlp, args, {
         windowsHide: true,
         env: { ...process.env, ...this.tools.env, PYTHONIOENCODING: 'utf-8' },
       });
@@ -140,6 +201,7 @@ class VideoDownload extends EventEmitter {
       });
       child.on('close', (code) => {
         if (buffer) onLine(buffer.trim());
+        this.#removeCookieFile();
         this.child = null;
         this.connections = 0;
         if (this.pauseRequested) this.#setStatus('paused');
@@ -235,4 +297,4 @@ function updateYtDlp(tools) {
   });
 }
 
-module.exports = { VideoDownload, isVideoPageUrl, updateYtDlp, QUALITIES };
+module.exports = { VideoDownload, isVideoPageUrl, updateYtDlp, killTree, toNetscapeCookies, QUALITIES };

@@ -19,6 +19,13 @@ function findVideoTools() {
   return { ytdlp, ffmpegDir: BIN, jsRuntime: process.execPath, env: { ELECTRON_RUN_AS_NODE: '1' } };
 }
 
+/** ffmpeg/ffprobe from bin/, used by HLS/DASH downloads to join and check tracks. */
+function findStreamTools() {
+  const exe = (name) => path.join(BIN, process.platform === 'win32' ? `${name}.exe` : name);
+  if (!fs.existsSync(exe('ffmpeg'))) return null;
+  return { ffmpeg: exe('ffmpeg'), ffprobe: fs.existsSync(exe('ffprobe')) ? exe('ffprobe') : null };
+}
+
 // Optional separate profile (settings, list and browser cache), e.g. for a portable copy.
 if (process.env.MD_USER_DATA) app.setPath('userData', path.resolve(process.env.MD_USER_DATA));
 
@@ -117,7 +124,11 @@ if (!app.requestSingleInstanceLock()) {
       const d = findDownload(id);
       if (d) return clipboard.writeText(d.url);
     });
-    ipcMain.handle('settings:get', () => ({ ...manager.settings, videoAvailable: !!manager.videoTools }));
+    ipcMain.handle('settings:get', () => ({
+      ...manager.settings,
+      videoAvailable: !!manager.videoTools,
+      ffmpegAvailable: !!manager.streamTools,
+    }));
     ipcMain.handle('video:update', () => (manager.videoTools ? updateYtDlp(manager.videoTools) : 'yt-dlp não encontrado na pasta bin'));
     ipcMain.handle('settings:update', (_e, patch) => manager.updateSettings(patch ?? {}));
     ipcMain.handle('dialog:chooseFolder', async (_e, current) => {
@@ -125,6 +136,14 @@ if (!app.requestSingleInstanceLock()) {
         title: 'Escolha a pasta de downloads',
         defaultPath: current || manager.settings.downloadDir,
         properties: ['openDirectory', 'createDirectory'],
+      });
+      return result.canceled ? null : result.filePaths[0];
+    });
+    ipcMain.handle('dialog:chooseCookiesFile', async () => {
+      const result = await dialog.showOpenDialog(win, {
+        title: 'Escolha o arquivo de cookies (formato Netscape)',
+        filters: [{ name: 'Cookies', extensions: ['txt'] }, { name: 'Todos os arquivos', extensions: ['*'] }],
+        properties: ['openFile'],
       });
       return result.canceled ? null : result.filePaths[0];
     });
@@ -145,11 +164,11 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(() => {
     app.setAppUserModelId('local.meu-downloader');
-    const videoTools = findVideoTools();
     manager = new DownloadManager({
       storeDir: app.getPath('userData'),
       defaultDownloadDir: app.getPath('downloads'),
-      videoTools,
+      videoTools: findVideoTools(),
+      streamTools: findStreamTools(),
     });
     manager.on('update', (list) => win?.webContents.send('downloads:update', list));
     manager.on('completed', (d) => {

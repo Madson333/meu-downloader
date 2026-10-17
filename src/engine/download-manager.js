@@ -7,6 +7,8 @@ const { EventEmitter } = require('node:events');
 const { SegmentedDownload } = require('./segmented-download');
 const { SpeedLimiter } = require('./speed-limiter');
 const { VideoDownload, isVideoPageUrl, QUALITIES } = require('./video-download');
+const { StreamDownload, streamBaseName } = require('./stream-download');
+const { isManifestUrl } = require('./manifest');
 const { sanitize } = require('./file-name');
 
 const DEFAULT_SETTINGS = {
@@ -22,6 +24,18 @@ const DEFAULT_SETTINGS = {
   ],
   minCaptureSizeKB: 0,
   videoQuality: 'best',
+  // Session cookies for yt-dlp: none, browser (sent by the extension), firefox or file.
+  videoCookies: 'none',
+  videoCookiesFile: '',
+};
+
+const COOKIE_SOURCES = ['none', 'browser', 'firefox', 'file'];
+
+// A failed download whose errorCode is listed here is retried as another kind.
+const CONVERSIONS = {
+  HTML_PAGE: 'video',
+  STREAM_MANIFEST: 'stream',
+  NOT_A_STREAM: 'file',
 };
 
 const TICK_MS = 500;
@@ -41,10 +55,14 @@ function readJson(file, fallback) {
 }
 
 class DownloadManager extends EventEmitter {
-  /** `videoTools` ({ ytdlp, ffmpegDir, jsRuntime, env }) enables video pages; null disables them. */
-  constructor({ storeDir, defaultDownloadDir, videoTools = null }) {
+  /**
+   * `videoTools` ({ ytdlp, ffmpegDir, jsRuntime, env }) enables video pages; null disables them.
+   * `streamTools` ({ ffmpeg, ffprobe }) lets HLS/DASH downloads join audio and video.
+   */
+  constructor({ storeDir, defaultDownloadDir, videoTools = null, streamTools = null }) {
     super();
     this.videoTools = videoTools;
+    this.streamTools = streamTools;
     this.storeDir = storeDir;
     this.downloadsFile = path.join(storeDir, 'downloads.json');
     this.settingsFile = path.join(storeDir, 'settings.json');
@@ -64,13 +82,15 @@ class DownloadManager extends EventEmitter {
   }
 
   #attach(state) {
-    const download = state.kind === 'video' ? this.#createVideo(state) : this.#createFile(state);
+    const download = state.kind === 'video' ? this.#createVideo(state)
+      : state.kind === 'stream' ? this.#createStream(state) : this.#createFile(state);
     download.on('change', () => {
       this.dirty = true;
       const { status } = download.state;
       if (status !== 'downloading') this.speeds.delete(download.state.id);
-      if (status === 'error' && download.state.errorCode === 'HTML_PAGE' && this.videoTools) {
-        this.#convertToVideo(download);
+      const target = status === 'error' ? CONVERSIONS[download.state.errorCode] : null;
+      if (target && (target !== 'video' || this.videoTools)) {
+        this.#convert(download, target);
         return;
       }
       if (status === 'completed') this.emit('completed', this.#view(download));
@@ -82,14 +102,46 @@ class DownloadManager extends EventEmitter {
   }
 
   #createVideo(state) {
-    return new VideoDownload(state, { tools: this.videoTools, getSettings: () => this.settings });
+    return new VideoDownload(state, {
+      tools: this.videoTools,
+      getSettings: () => this.settings,
+      sessionDir: path.join(this.storeDir, 'sessions'),
+    });
   }
 
-  /** The link served a web page: hand it to yt-dlp under the same id. */
-  #convertToVideo(download) {
-    const { id, url, dir, createdAt, headers, quality } = download.state;
+  #createStream(state) {
+    const download = new StreamDownload(state, {
+      limiter: this.limiter,
+      getMaxConnections: () => this.settings.maxConnections,
+      tools: this.streamTools,
+      isPathTaken: (candidate) => [...this.downloads.values()].some(
+        (d) => d !== download && d.state.filePath?.toLowerCase() === candidate.toLowerCase(),
+      ),
+    });
+    return download;
+  }
+
+  /**
+   * Retries a download as another kind under the same id: a web page goes to
+   * yt-dlp, a manifest to the stream engine, and a plain .m3u8 list (not HLS)
+   * back to a file download that will not divert it again.
+   */
+  #convert(download, kind) {
+    const { id, url, dir, createdAt, headers, quality, suggestedName, fileName } = download.state;
     download.removeAllListeners('change');
-    this.#attach({ id, url, dir, createdAt, headers, kind: 'video', quality: quality ?? this.settings.videoQuality, status: 'queued' });
+    this.#attach({
+      id,
+      url,
+      dir,
+      createdAt,
+      headers,
+      suggestedName,
+      kind,
+      quality: quality ?? this.settings.videoQuality,
+      fileName: kind === 'stream' ? streamBaseName(url, suggestedName) : fileName,
+      forceFile: kind === 'file' ? true : undefined,
+      status: 'queued',
+    });
     this.dirty = true;
     this.#schedule();
     this.#emitUpdate();
@@ -110,14 +162,17 @@ class DownloadManager extends EventEmitter {
     const parsed = new URL(url);
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('Apenas links http e https são suportados');
     const id = crypto.randomUUID();
+    const kind = isManifestUrl(parsed.href) ? 'stream'
+      : this.videoTools && isVideoPageUrl(parsed.href) ? 'video' : 'file';
     this.#attach({
       id,
       url: parsed.href,
-      kind: this.videoTools && isVideoPageUrl(parsed.href) ? 'video' : 'file',
+      kind,
       quality: QUALITIES.includes(quality) ? quality : this.settings.videoQuality,
       dir: dir || this.settings.downloadDir,
       suggestedName: fileName ? sanitize(fileName) : null,
-      fileName: fileName ? sanitize(fileName) : parsed.pathname.split('/').pop() || parsed.hostname,
+      fileName: kind === 'stream' ? streamBaseName(parsed.href, fileName)
+        : fileName ? sanitize(fileName) : parsed.pathname.split('/').pop() || parsed.hostname,
       headers: { referrer: referrer || null, cookie: cookie || null, userAgent: userAgent || null },
       status: startPaused ? 'paused' : 'queued',
       createdAt: Date.now(),
@@ -171,6 +226,9 @@ class DownloadManager extends EventEmitter {
     next.speedLimitKBps = Math.max(0, Number(next.speedLimitKBps) || 0);
     next.minCaptureSizeKB = Math.max(0, Number(next.minCaptureSizeKB) || 0);
     if (!QUALITIES.includes(next.videoQuality)) next.videoQuality = 'best';
+    if (!COOKIE_SOURCES.includes(next.videoCookies)) next.videoCookies = 'none';
+    next.videoCookiesFile = typeof next.videoCookiesFile === 'string' ? next.videoCookiesFile : '';
+    if (next.videoCookiesFile && !path.isAbsolute(next.videoCookiesFile)) next.videoCookiesFile = '';
     next.captureExtensions = [...new Set((next.captureExtensions ?? [])
       .map((e) => String(e).trim().toLowerCase().replace(/^\./, ''))
       .filter(Boolean))];
@@ -227,8 +285,13 @@ class DownloadManager extends EventEmitter {
       id: s.id,
       url: s.url,
       kind: s.kind ?? 'file',
-      quality: s.kind === 'video' ? s.quality : null,
+      quality: s.kind === 'video' || s.kind === 'stream' ? s.quality : null,
       phase: s.phase ?? null,
+      protocol: s.protocol ?? null,
+      selection: s.selection ?? null,
+      notices: s.notices ?? [],
+      chunks: s.kind === 'stream' ? s.chunks ?? null : null,
+      sizeEstimated: !!s.sizeEstimated && s.status !== 'completed',
       fileName: s.fileName,
       filePath: s.filePath ?? null,
       dir: s.dir,

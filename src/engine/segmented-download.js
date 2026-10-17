@@ -5,6 +5,7 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const { request, parseContentRange, HttpError } = require('./http-client');
 const { chooseFileName, uniquePath } = require('./file-name');
+const { isManifestMime } = require('./manifest');
 
 const MAX_ATTEMPTS = 6;
 const TEMP_SUFFIX = '.mdpart';
@@ -156,6 +157,11 @@ class SegmentedDownload extends EventEmitter {
     // A web page in response to a link that does not name an HTML file means the
     // link opens a page (e.g. a video site), not a downloadable file.
     const mime = String(res.headers['content-type'] ?? '').toLowerCase();
+    // An HLS/DASH manifest served without a .m3u8/.mpd name: the manager hands it to the stream engine.
+    if (!this.state.forceFile && isManifestMime(mime)) {
+      res.destroy();
+      throw new HttpError('O link é um manifesto de stream (HLS/DASH)', { code: 'STREAM_MANIFEST' });
+    }
     if (mime.startsWith('text/html') && !/\.x?html?$/i.test(new URL(finalUrl).pathname)) {
       res.destroy();
       throw new HttpError('O link abre uma página web, não um arquivo. Copie o link direto do arquivo.', { code: 'HTML_PAGE' });

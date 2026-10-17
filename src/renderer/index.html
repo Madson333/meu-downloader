@@ -78,7 +78,9 @@
           <div><span class="muted">Conexões</span><b id="d-conns"></b></div>
           <div><span class="muted">Segmentos</span><b id="d-segs"></b></div>
           <div><span class="muted" id="d-kind-label">Retomável</span><b id="d-resumable"></b></div>
+          <div class="wide" id="d-tracks-row" hidden><span class="muted">Faixas</span><b id="d-tracks"></b></div>
           <div class="wide"><span class="muted">Salvo em</span><b id="d-path"></b></div>
+          <div class="wide notice-text" id="d-notices"></div>
           <div class="wide error-text" id="d-error"></div>
         </div>
       </aside>
@@ -100,7 +102,7 @@
           <button type="button" id="add-dir-btn">Escolher…</button>
         </span>
       </label>
-      <label id="add-quality-row">Qualidade <span class="muted">(links de vídeo: YouTube, Vimeo, TikTok…)</span>
+      <label id="add-quality-row">Qualidade <span class="muted">(vídeos de sites e streams HLS/DASH)</span>
         <select id="add-quality">
           <option value="best">Melhor disponível</option>
           <option value="2160">Até 4K (2160p)</option>
@@ -158,6 +160,18 @@
           <button type="button" id="set-update-ytdlp" title="O YouTube muda com frequência; atualize se os vídeos pararem de baixar">Atualizar yt-dlp</button>
         </span>
         <span id="set-update-status" class="muted"></span>
+      </label>
+      <label id="set-cookies-row">Cookies para vídeos com login <span class="muted">(yt-dlp; use só com contas suas)</span>
+        <span class="row">
+          <select id="set-cookies">
+            <option value="none">Não usar</option>
+            <option value="browser">Sessão enviada pela extensão do navegador</option>
+            <option value="firefox">Ler do Firefox</option>
+            <option value="file">Arquivo cookies.txt…</option>
+          </select>
+          <input id="set-cookies-file" type="text" readonly placeholder="Nenhum arquivo">
+          <button type="button" id="set-cookies-btn">Escolher…</button>
+        </span>
       </label>
       <label class="check"><input id="set-capture" type="checkbox"> Capturar downloads do navegador (extensão)</label>
       <label>Extensões capturadas (separadas por espaço)

@@ -63,7 +63,7 @@ function visible() {
   const q = query.toLowerCase();
   return downloads
     .filter(FILTERS[filter])
-    .filter((d) => !q || d.fileName.toLowerCase().includes(q) || d.url.toLowerCase().includes(q))
+    .filter((d) => !q || (d.fileName ?? '').toLowerCase().includes(q) || d.url.toLowerCase().includes(q))
     .sort((a, b) => b.createdAt - a.createdAt);
 }
 
@@ -82,15 +82,31 @@ function createRow(d) {
   return tr;
 }
 
+/** Percent done: by bytes, or by segments while a stream's size is still unknown. */
+function progressOf(d) {
+  if (d.totalSize) return Math.min(100, (d.downloaded / d.totalSize) * 100);
+  if (d.chunks?.total) return Math.min(100, (d.chunks.done / d.chunks.total) * 100);
+  return null;
+}
+
+function kindBadge(d, fileExt) {
+  if (d.status === 'completed' && fileExt !== '?') return fileExt;
+  if (d.kind === 'video') return 'vídeo';
+  if (d.kind === 'stream') return d.protocol ? d.protocol.toUpperCase() : 'stream';
+  return fileExt;
+}
+
 function updateRow(tr, d) {
-  const pct = d.totalSize ? Math.min(100, (d.downloaded / d.totalSize) * 100) : null;
+  const pct = progressOf(d);
   const ext = tr.querySelector('.ext');
   const fileExt = extensionOf(d.fileName);
-  ext.textContent = d.kind === 'video' && (fileExt === '?' || d.status !== 'completed') ? 'vídeo' : fileExt;
-  ext.classList.toggle('video', d.kind === 'video');
-  tr.querySelector('.file-name').textContent = d.fileName;
+  ext.textContent = kindBadge(d, fileExt);
+  ext.classList.toggle('video', d.kind === 'video' || d.kind === 'stream');
+  tr.querySelector('.file-name').textContent = d.fileName ?? '';
   tr.title = d.url;
-  tr.querySelector('.size').textContent = d.totalSize ? formatBytes(d.totalSize) : formatBytes(d.downloaded);
+  tr.querySelector('.size').textContent = d.totalSize
+    ? `${d.sizeEstimated ? '~' : ''}${formatBytes(d.totalSize)}`
+    : formatBytes(d.downloaded);
   const fill = tr.querySelector('.fill');
   fill.className = 'fill' + (d.status === 'completed' ? ' done' : d.status === 'paused' || d.status === 'queued'
     ? ' paused' : d.status === 'error' ? ' error' : '');
@@ -163,10 +179,16 @@ function renderDetails() {
     ? `${formatBytes(d.downloaded)} de ${formatBytes(d.totalSize)}`
     : formatBytes(d.downloaded);
   $('d-conns').textContent = d.status === 'downloading' ? String(d.connections) : '—';
-  $('d-segs').textContent = String(d.segments.length || '—');
+  $('d-segs').textContent = d.chunks?.total ? `${d.chunks.done} de ${d.chunks.total}` : String(d.segments.length || '—');
+  $('d-tracks-row').hidden = d.kind !== 'stream' || !d.selection;
+  $('d-tracks').textContent = describeTracks(d.selection);
+  $('d-notices').textContent = (d.notices ?? []).join(' · ');
   if (d.kind === 'video') {
     $('d-kind-label').textContent = 'Tipo';
     $('d-resumable').textContent = `Vídeo (yt-dlp) · ${QUALITY_LABEL[d.quality] ?? d.quality}`;
+  } else if (d.kind === 'stream') {
+    $('d-kind-label').textContent = 'Tipo';
+    $('d-resumable').textContent = `Stream ${d.protocol ? d.protocol.toUpperCase() : 'HLS/DASH'} · ${QUALITY_LABEL[d.quality] ?? d.quality}`;
   } else {
     $('d-kind-label').textContent = 'Retomável';
     $('d-resumable').textContent = d.status === 'queued' && !d.segments.length ? '—' : d.resumable ? 'Sim' : 'Não';
@@ -175,6 +197,15 @@ function renderDetails() {
   $('d-error').textContent = d.error ? `Erro: ${d.error}` : '';
   $('d-open').disabled = d.status !== 'completed';
   drawSegmentMap(d);
+}
+
+function describeTracks(selection) {
+  if (!selection) return '';
+  const parts = [];
+  if (selection.video) parts.push(`vídeo ${selection.video}`);
+  if (selection.audio) parts.push(`áudio ${selection.audio}`);
+  if (selection.subtitles?.length) parts.push(`legendas: ${selection.subtitles.join(', ')}`);
+  return parts.join(' — ');
 }
 
 function cssVar(name) {
@@ -198,6 +229,12 @@ function drawSegmentMap(d) {
   if (d.status === 'completed') {
     ctx.fillStyle = cssVar('--ok');
     ctx.fillRect(0, 0, width, height);
+    return;
+  }
+  if (d.chunks?.total) {
+    // Streams have no byte map: show the share of finished segments.
+    ctx.fillStyle = cssVar('--seg-done');
+    ctx.fillRect(0, 0, (d.chunks.done / d.chunks.total) * width, height);
     return;
   }
   if (!total) return;
@@ -252,7 +289,7 @@ async function openAddDialog(url = '') {
   if (settings.status === 'fulfilled') {
     if (!$('add-dir').value) $('add-dir').value = settings.value.downloadDir;
     $('add-quality').value = settings.value.videoQuality;
-    $('add-quality-row').hidden = !settings.value.videoAvailable;
+    $('add-quality-row').hidden = !settings.value.videoAvailable && !settings.value.ffmpegAvailable;
   }
   if (clip.status === 'fulfilled' && clip.value && !$('add-url').value) {
     $('add-url').value = clip.value;
@@ -271,8 +308,18 @@ async function openSettings() {
   $('set-exts').value = s.captureExtensions.join(' ');
   $('set-quality').value = s.videoQuality;
   $('set-quality-row').hidden = !s.videoAvailable;
+  $('set-cookies-row').hidden = !s.videoAvailable;
+  $('set-cookies').value = s.videoCookies;
+  $('set-cookies-file').value = s.videoCookiesFile;
+  updateCookiesRow();
   $('set-update-status').textContent = '';
   $('dlg-settings').showModal();
+}
+
+function updateCookiesRow() {
+  const file = $('set-cookies').value === 'file';
+  $('set-cookies-file').hidden = !file;
+  $('set-cookies-btn').hidden = !file;
 }
 
 function confirmRemove() {
@@ -318,6 +365,12 @@ function bindEvents() {
     if (dir) $('set-dir').value = dir;
   });
 
+  $('set-cookies').addEventListener('change', updateCookiesRow);
+  $('set-cookies-btn').addEventListener('click', async () => {
+    const file = await api.chooseCookiesFile();
+    if (file) $('set-cookies-file').value = file;
+  });
+
   $('set-update-ytdlp').addEventListener('click', async () => {
     const button = $('set-update-ytdlp');
     button.disabled = true;
@@ -358,6 +411,8 @@ function bindEvents() {
       captureEnabled: $('set-capture').checked,
       captureExtensions: $('set-exts').value.split(/[\s,;]+/),
       videoQuality: $('set-quality').value,
+      videoCookies: $('set-cookies').value,
+      videoCookiesFile: $('set-cookies-file').value,
     });
   });
 

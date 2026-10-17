@@ -7,9 +7,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { VideoDownload } = require('../src/engine/video-download');
+const { VideoDownload, toNetscapeCookies } = require('../src/engine/video-download');
 const { DownloadManager } = require('../src/engine/download-manager');
 const { startFileServer } = require('./helpers/file-server');
+const { startStreamServer } = require('./helpers/stream-server');
 
 const BIN = path.join(__dirname, '..', 'bin');
 const YTDLP = path.join(BIN, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
@@ -87,6 +88,51 @@ test('a link that opens a page with a player becomes a video download', { skip: 
   assert.equal(final.kind, 'video');
   assert.equal(final.status, 'completed', final.error);
   assert.equal(sha256(final.filePath), server.sha);
+});
+
+test('cookie sources: the browser session and a cookies.txt reach yt-dlp through temporary files', { skip: !available && 'bin/yt-dlp ausente' }, async () => {
+  const streams = await startStreamServer();
+  try {
+    const body = crypto.randomBytes(256 * 1024);
+    streams.set('/clip.mp4', body, { type: 'video/mp4' });
+    const sessionDir = newDir();
+    const run = async (cookieSettings, headers) => {
+      const d = new VideoDownload(
+        { id: crypto.randomUUID(), url: `${streams.base}/clip.mp4`, dir: newDir(), quality: 'best', headers },
+        { tools, getSettings: () => ({ ...settings, ...cookieSettings }), sessionDir },
+      );
+      const before = streams.log.length;
+      await d.start();
+      assert.equal(d.state.status, 'completed', d.state.error);
+      assert.equal(sha256(d.state.filePath), crypto.createHash('sha256').update(body).digest('hex'));
+      assert.deepEqual(fs.readdirSync(sessionDir), [], 'the session file must be deleted');
+      return streams.log.slice(before).filter((r) => r.path === '/clip.mp4');
+    };
+
+    const fromBrowser = await run({ videoCookies: 'browser' }, { cookie: 'session=abc; theme=dark' });
+    assert.ok(fromBrowser.length > 0 && fromBrowser.every((r) => /session=abc/.test(r.cookie ?? '')), JSON.stringify(fromBrowser));
+
+    const cookiesFile = path.join(newDir(), 'cookies.txt');
+    const original = `# Netscape HTTP Cookie File\n127.0.0.1\tFALSE\t/\tFALSE\t0\tlogin\txyz\n`;
+    fs.writeFileSync(cookiesFile, original);
+    const fromFile = await run({ videoCookies: 'file', videoCookiesFile: cookiesFile }, {});
+    assert.ok(fromFile.every((r) => /login=xyz/.test(r.cookie ?? '')), JSON.stringify(fromFile));
+    assert.equal(fs.readFileSync(cookiesFile, 'utf8'), original, "yt-dlp must not rewrite the user's file");
+
+    const none = await run({ videoCookies: 'none' }, { cookie: 'session=abc' });
+    assert.ok(none.every((r) => r.cookie === null));
+  } finally {
+    await streams.close();
+  }
+});
+
+test('cookie settings are validated', () => {
+  const manager = new DownloadManager({ storeDir: newDir(), defaultDownloadDir: newDir() });
+  assert.equal(manager.updateSettings({ videoCookies: 'chrome-secret-db' }).videoCookies, 'none');
+  assert.equal(manager.updateSettings({ videoCookies: 'file', videoCookiesFile: 'relativo.txt' }).videoCookiesFile, '');
+  assert.equal(toNetscapeCookies('a=1; bad\tname=2; =x', 'https://www.example.com/v').split('\n').length, 3);
+  assert.equal(toNetscapeCookies('', 'https://www.example.com/v'), null);
+  clearInterval(manager.timer);
 });
 
 test('video page hosts go straight to yt-dlp', () => {
